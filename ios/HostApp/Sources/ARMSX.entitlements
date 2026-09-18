@@ -6,8 +6,6 @@
 	<true/>
 	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
 	<true/>
-	<key>dynamic-codesigning</key>
-	<true/>
 	<key>get-task-allow</key>
 	<true/>
 </dict>

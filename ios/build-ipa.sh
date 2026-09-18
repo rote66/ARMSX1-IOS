@@ -166,13 +166,17 @@ ldid -e "$APP_ROOT/ARMSX" > "$SIGNED_ENTITLEMENTS"
 for entitlement in \
     com.apple.security.cs.allow-jit \
     com.apple.security.cs.allow-unsigned-executable-memory \
-    dynamic-codesigning \
     get-task-allow; do
     if ! grep -q "<key>${entitlement}</key>" "$SIGNED_ENTITLEMENTS"; then
         echo "Signed app is missing entitlement: ${entitlement}" >&2
         exit 1
     fi
 done
+
+if grep -q '<key>dynamic-codesigning</key>' "$SIGNED_ENTITLEMENTS"; then
+    echo "Signed app contains TrollStore-incompatible entitlement: dynamic-codesigning" >&2
+    exit 1
+fi
 
 rm -f "$IPA_OUTPUT"
 (
