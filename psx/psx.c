@@ -1,4 +1,5 @@
 #include "psx.h"
+#include "fastboot.h"
 
 psx_t* psx_create(void) {
     return (psx_t*)malloc(sizeof(psx_t));
@@ -82,15 +83,15 @@ uint32_t psx_get_dmode_width(psx_t* psx) {
 }
 
 uint32_t psx_get_dmode_height(psx_t* psx) {
-    if (psx->gpu->display_mode & 0x4)
-        return 480;
+    const int pal = (psx->gpu->display_mode & 0x8) != 0;
+    const int interlaced = (psx->gpu->display_mode & 0x4) != 0;
+    const int maximum = pal ? 256 : 240;
+    int visible = (int)psx->gpu->disp_y2 - (int)psx->gpu->disp_y1;
 
-    int disp = psx->gpu->disp_y2 - psx->gpu->disp_y1;
+    if (visible <= 0 || visible > maximum)
+        visible = maximum;
 
-    if (disp < (255-16))
-        return disp;
-
-    return 240;
+    return (uint32_t)(interlaced ? visible * 2 : visible);
 }
 
 double psx_get_display_aspect(psx_t* psx) {
@@ -193,6 +194,7 @@ void psx_hard_reset(psx_t* psx) {
 }
 
 void psx_soft_reset(psx_t* psx) {
+    psx_fastboot_rearm();
     psx_cpu_init(psx->cpu, psx->bus);
 }
 

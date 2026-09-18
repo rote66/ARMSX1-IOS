@@ -69,17 +69,22 @@ void real_idct(int16_t* blk, int16_t* scale) {
 
 #define IDCT_FUNC(blk, scale) real_idct(blk, scale)
 
-uint16_t* rl_decode_block(int16_t* blk, uint16_t* src, uint8_t* quant, int16_t* scale) {
+uint16_t* rl_decode_block(int16_t* blk, uint16_t* src, uint16_t* end, uint8_t* quant, int16_t* scale) {
     int k = 0;
 
     for (int i = 0; i < 64; i++)
         blk[i] = 0;
-    
+
+    if (!src || !end || src >= end) {
+        IDCT_FUNC(blk, scale);
+        return end;
+    }
+
     uint16_t n = *src;
 
     ++src;
 
-    while (n == 0xfe00) {
+    while (n == 0xfe00 && src < end) {
         n = *src;
 
         ++src;
@@ -102,14 +107,18 @@ uint16_t* rl_decode_block(int16_t* blk, uint16_t* src, uint8_t* quant, int16_t* 
         if (!q_scale)
             blk[k] = val;
 
-        n = *src;
-
-        if (k == 63)
+        if (src >= end || k == 63)
             break;
 
-        ++src;
+        n = *src++;
+
+        if (n == 0xfe00)
+            break;
 
         k += ((n >> 10) & 0x3f) + 1;
+
+        if (k >= 64)
+            break;
 
         val = (EXTS10(n & 0x3ff) * quant[k] * q_scale + 4) / 8;
     }
@@ -178,13 +187,23 @@ void yuv_to_rgb(psx_mdec_t* mdec, uint8_t* buf, int xx, int yy) {
 void mdec_nop(psx_mdec_t* mdec) { /* Do nothing */ }
 
 void mdec_decode_macroblock(psx_mdec_t* mdec) {
+    uint16_t* const input_begin = (uint16_t*)mdec->input;
+    uint16_t* const input_end = (uint16_t*)(mdec->input + mdec->input_size);
+
+    if (!mdec->input || mdec->input_size < sizeof(uint16_t)) {
+        mdec->output_words_remaining = 0;
+        mdec->output_empty = 1;
+        mdec->output_request = 0;
+        return;
+    }
+
     if (mdec->output_depth < 2) {
         size_t block_size = (mdec->output_depth == 3) ? 512 : 768;
         size_t size = block_size;
 
         mdec->output = malloc(size);
 
-        rl_decode_block(mdec->yblk, (uint16_t*)mdec->input, mdec->y_quant_table, mdec->scale_table);
+        rl_decode_block(mdec->yblk, input_begin, input_end, mdec->y_quant_table, mdec->scale_table);
 
         for (int i = 0; i < 64; i++) {
             int16_t y = mdec->yblk[i] & 0xff;
@@ -201,7 +220,7 @@ void mdec_decode_macroblock(psx_mdec_t* mdec) {
         mdec->output_empty = 0;
         mdec->output_index = 0;
     } else {
-        uint16_t* in = (uint16_t*)mdec->input;
+        uint16_t* in = input_begin;
 
         size_t block_size = (mdec->output_depth == 3) ? 512 : 768;
         size_t size = block_size;
@@ -210,22 +229,22 @@ void mdec_decode_macroblock(psx_mdec_t* mdec) {
 
         int block_count = 1;
 
-        while (bytes_processed < mdec->input_size) {
+        while (in < input_end && bytes_processed < mdec->input_size) {
             if (!mdec->output) {
                 mdec->output = malloc(block_count * size);
             } else {
                 mdec->output = realloc(mdec->output, block_count * size);
             }
 
-            in = rl_decode_block(mdec->crblk, in, mdec->uv_quant_table, mdec->scale_table);
-            in = rl_decode_block(mdec->cbblk, in, mdec->uv_quant_table, mdec->scale_table);
-            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->crblk, in, input_end, mdec->uv_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->cbblk, in, input_end, mdec->uv_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
             yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 0, 0);
-            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
             yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 8, 0);
-            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
             yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 0, 8);
-            in = rl_decode_block(mdec->yblk, in, mdec->y_quant_table, mdec->scale_table);
+            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
             yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 8, 8);
 
             bytes_processed = (uintptr_t)in - (uintptr_t)mdec->input;

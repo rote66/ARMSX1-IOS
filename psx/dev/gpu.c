@@ -356,7 +356,10 @@ void gpu_render_triangle(psx_gpu_t* gpu, vertex_t v0, vertex_t v1, vertex_t v2, 
                 float tx = ((z0 * a.tx) + (z1 * b.tx) + (z2 * c.tx)) / area;
                 float ty = ((z0 * a.ty) + (z1 * b.ty) + (z2 * c.ty)) / area;
 
-                uint16_t texel = gpu_fetch_texel_bilinear(gpu, tx, ty, tpx, tpy, clutx, cluty, depth);
+                /* The PS1 point-samples textures. Bilinear filtering bleeds transparent
+                   neighbours into font-atlas glyphs and can make BIOS lettering incomplete. */
+                uint16_t texel = gpu_fetch_texel(
+                    gpu, (uint16_t)tx, (uint16_t)ty, tpx, tpy, clutx, cluty, depth);
 
                 if (!texel)
                     continue;

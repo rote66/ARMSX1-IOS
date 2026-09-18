@@ -1,5 +1,6 @@
 #include "cpu.h"
 #include "bus.h"
+#include "fastboot.h"
 #include "log.h"
 
 #include <stddef.h>
@@ -350,6 +351,9 @@ void psx_cpu_cycle(psx_cpu_t* cpu) {
     if ((cpu->pc & 0x3fffffff) == 0x000000b4)
         if (cpu->b_function_hook)
             cpu->b_function_hook(cpu);
+
+    if (psx_bus_physical_address(cpu->pc) == PSX_FASTBOOT_SHELL_PHYS && psx_fastboot_try(cpu))
+        return;
 
     cpu->saved_pc = cpu->pc;
     cpu->delay_slot = cpu->branch;
