@@ -62,6 +62,7 @@
 
 extern "C" {
 #include "../psx/psx.h"
+#include "../psx/fastboot.h"
 #include "../psx/dev/cdrom/cdrom.h"
 #include "../psx/dev/gpu.h"
 #include "../psx/dev/input.h"
@@ -248,7 +249,7 @@ enum class LaunchKind {
 };
 
 const char* CpuEngineTitle(psx_cpu_execution_mode_t mode) {
-    return mode == PSX_CPU_INTERPRETER ? "Interpreter" : "Cached interpreter";
+    return mode == PSX_CPU_INTERPRETER ? "参考解释器" : "缓存解释器";
 }
 
 const char* CpuEngineSettingToken(psx_cpu_execution_mode_t mode) {
@@ -542,6 +543,8 @@ struct FrontendSettings {
 #endif
     bool texture_scale_mode = false;
     bool debug_panel = false;
+    bool show_fps = false;
+    bool fast_boot = false;
     bool stretch_mode = false;
     int display_aspect = 0;
     int upscale_height = 480;
@@ -626,6 +629,14 @@ std::string DefaultSettingsPath() {
 }
 
 std::filesystem::path DefaultBrowseDirectory() {
+#if defined(IOS_TARGET)
+    const char* documents = std::getenv("ARMSX_DOCUMENTS_DIR");
+
+    if (documents && documents[0]) {
+        return std::filesystem::path(documents);
+    }
+#endif
+
     const char* pref = psxe_cfg_get_pref_path();
 
     if (pref && pref[0]) {
@@ -636,6 +647,9 @@ std::filesystem::path DefaultBrowseDirectory() {
 }
 
 std::filesystem::path DefaultDiagnosticsLogPath() {
+#if defined(IOS_TARGET)
+    return DefaultBrowseDirectory() / "armsx_log.txt";
+#else
     std::filesystem::path path = DefaultBrowseDirectory() / "logs";
 #if defined(UWP_TARGET)
     path /= "armsx-uwp.log";
@@ -643,6 +657,7 @@ std::filesystem::path DefaultDiagnosticsLogPath() {
     path /= "armsx.log";
 #endif
     return path;
+#endif
 }
 
 std::string AppendBrowseRootHint(std::string summary) {
@@ -650,7 +665,7 @@ std::string AppendBrowseRootHint(std::string summary) {
     if (!summary.empty() && summary.back() != ' ') {
         summary.push_back(' ');
     }
-    summary += "Use Filesystem Roots or Parent Directory to switch drives.";
+    summary += "使用“文件系统根目录”或“上级目录”切换位置。";
 #endif
     return summary;
 }
@@ -958,9 +973,9 @@ const char* AspectToString(int aspect) {
 
 const char* AspectTitle(int aspect) {
     switch (aspect) {
-        case 1: return "Square";
-        case 2: return "Wide 16:9";
-        default: return "Classic";
+        case 1: return "方形 1:1";
+        case 2: return "宽屏 16:9";
+        default: return "经典 4:3";
     }
 }
 
@@ -975,16 +990,16 @@ const char* UpscaleToString(int height) {
 }
 
 std::string BoolTitle(bool value) {
-    return value ? "On" : "Off";
+    return value ? "开" : "关";
 }
 
 std::string RendererValueTitle(const FrontendSettings& settings) {
-    std::string value = settings.texture_scale_mode ? "Linear" : "Nearest";
+    std::string value = settings.texture_scale_mode ? "线性" : "最近邻";
 
     if (settings.stretch_mode) {
-        value += ", Stretch";
+        value += "，拉伸";
     } else {
-        value += ", Fit";
+        value += "，保持比例";
     }
 
     return value;
@@ -998,10 +1013,10 @@ constexpr bool SupportsHardwareGpuBackend() {
 const char* GpuBackendTitle(GpuBackend backend) {
     switch (backend) {
         case GpuBackend::SDLAccelerated:
-            return "SDL accelerated";
+            return "SDL 加速";
         case GpuBackend::Software:
         default:
-            return "SDL software";
+            return "SDL 软件";
     }
 }
 
@@ -1296,7 +1311,7 @@ std::vector<fsui::SettingsChoiceOption> BuildChoices(const std::vector<std::stri
 
 std::vector<fsui::SettingsChoiceOption> BuildCpuEngineChoices(psx_cpu_execution_mode_t mode) {
     return BuildChoices(
-        {"Cached interpreter", "Reference interpreter"},
+        {"缓存解释器", "参考解释器"},
         mode == PSX_CPU_INTERPRETER ? 1 : 0
     );
 }
@@ -1304,14 +1319,14 @@ std::vector<fsui::SettingsChoiceOption> BuildCpuEngineChoices(psx_cpu_execution_
 #ifdef USE_HARDWARE
 std::vector<fsui::SettingsChoiceOption> BuildGpuBackendChoices(GpuBackend current_backend) {
     return BuildChoices(
-        {"SDL software", "SDL accelerated"},
+        {"SDL 软件", "SDL 加速"},
         static_cast<int>(current_backend == GpuBackend::SDLAccelerated ? 1 : 0)
     );
 }
 #endif
 
 std::vector<fsui::SettingsChoiceOption> BuildAspectChoices(int current) {
-    return BuildChoices({"Classic", "Square", "Wide 16:9"}, current);
+    return BuildChoices({"经典 4:3", "方形 1:1", "宽屏 16:9"}, current);
 }
 
 std::vector<fsui::SettingsChoiceOption> BuildUpscaleChoices(int current_height) {
@@ -1356,7 +1371,7 @@ std::vector<fsui::SettingsChoiceOption> BuildPresentationUpscaleChoices(int curr
 
 std::vector<fsui::SettingsChoiceOption> BuildRegionChoices(const std::string& current_region) {
     const std::vector<std::string> values = {"auto", "ntsc", "pal"};
-    const std::vector<std::string> labels = {"Auto", "NTSC", "PAL"};
+    const std::vector<std::string> labels = {"自动", "NTSC", "PAL"};
     const std::string current = ToLower(current_region);
     int selected = 0;
 
@@ -1394,7 +1409,7 @@ std::vector<fsui::SettingsChoiceOption> BuildModelChoices(const std::string& cur
 }
 
 std::vector<fsui::SettingsChoiceOption> BuildLogLevelChoices(int current_level) {
-    const std::vector<std::string> labels = {"Trace", "Debug", "Info", "Warn", "Error", "Fatal"};
+    const std::vector<std::string> labels = {"跟踪", "调试", "信息", "警告", "错误", "严重"};
     const int clamped = std::clamp(current_level, static_cast<int>(LOG_TRACE), static_cast<int>(LOG_FATAL));
     return BuildChoices(labels, clamped);
 }
@@ -1531,6 +1546,11 @@ void LoadExtraSettings(FrontendSettings& settings, const CliFlags& cli) {
         if (!cli.bios) {
             CopyTomlPathString(toml_string_in(bios, "override_file"), settings.bios_override);
         }
+
+        toml_datum_t fast_boot = toml_bool_in(bios, "fast_boot");
+        if (fast_boot.ok) {
+            settings.fast_boot = fast_boot.u.b != 0;
+        }
     }
 
     if (toml_table_t* console = toml_table_in(root, "console")) {
@@ -1612,6 +1632,11 @@ void LoadExtraSettings(FrontendSettings& settings, const CliFlags& cli) {
         toml_datum_t debug_panel = toml_bool_in(video, "debug_panel");
         if (debug_panel.ok) {
             settings.debug_panel = debug_panel.u.b != 0;
+        }
+
+        toml_datum_t show_fps = toml_bool_in(video, "show_fps");
+        if (show_fps.ok) {
+            settings.show_fps = show_fps.u.b != 0;
         }
 
         toml_datum_t stretch_mode = toml_bool_in(video, "stretch_mode");
@@ -1713,7 +1738,7 @@ FrontendSettings BuildSettings(const psxe_config_t* cfg, const CliFlags& cli) {
     settings.presentation_upscale = 1;
     settings.mobile_controls = DefaultMobileControlsEnabled();
     settings.ui_state.show_settings_overlay = settings.debug_panel;
-    settings.ui_state.show_performance_overlay = settings.debug_panel;
+    settings.ui_state.show_performance_overlay = settings.show_fps;
 
     if (!cli.bios && !settings.bios_override.empty()) {
         const std::filesystem::path bios_path(settings.bios_override);
@@ -1746,7 +1771,7 @@ FrontendSettings BuildSettings(const psxe_config_t* cfg, const CliFlags& cli) {
     settings.log_level = std::clamp(settings.log_level, static_cast<int>(LOG_TRACE), static_cast<int>(LOG_FATAL));
     settings.logging_enabled = !settings.quiet;
     settings.ui_state.show_settings_overlay = settings.debug_panel;
-    settings.ui_state.show_performance_overlay = settings.debug_panel;
+    settings.ui_state.show_performance_overlay = settings.show_fps;
 
     if (settings.ui_state.covers_path.empty()) {
         settings.ui_state.covers_path = DefaultBrowseDirectory() / "covers";
@@ -1791,7 +1816,8 @@ bool SaveSettings(const FrontendSettings& settings) {
         << "[bios]\n"
         << "    search_path     = \"" << EscapeTomlString(settings.bios_search) << "\"\n"
         << "    preferred_model = \"" << EscapeTomlString(settings.model) << "\"\n"
-        << "    override_file   = \"" << EscapeTomlString(settings.bios_override) << "\"\n\n"
+        << "    override_file   = \"" << EscapeTomlString(settings.bios_override) << "\"\n"
+        << "    fast_boot       = " << (settings.fast_boot ? "true" : "false") << "\n\n"
         << "[console]\n"
         << "    region          = \"" << EscapeTomlString(settings.region) << "\"\n\n"
         << "[cpu]\n"
@@ -1812,6 +1838,7 @@ bool SaveSettings(const FrontendSettings& settings) {
         << "    texture_scale_mode = " << (settings.texture_scale_mode ? "true" : "false") << "\n"
         << "    presentation_upscale = " << settings.presentation_upscale << "\n"
         << "    debug_panel = " << (settings.debug_panel ? "true" : "false") << "\n"
+        << "    show_fps = " << (settings.show_fps ? "true" : "false") << "\n"
         << "    stretch_mode = " << (settings.stretch_mode ? "true" : "false") << "\n"
         << "    display_aspect = \"" << AspectToString(settings.display_aspect) << "\"\n"
         << "    wide_upscale = \"" << UpscaleToString(settings.upscale_height) << "\"\n\n"
@@ -1893,7 +1920,7 @@ class ArmsxSession {
         destroy();
 
         if (!renderer) {
-            error = "Display is not ready.";
+            error = "显示系统尚未就绪。";
             return false;
         }
 
@@ -1909,26 +1936,49 @@ class ArmsxSession {
         std::unique_ptr<char, decltype(&free)> bios_guard(bios_path, &free);
 
         if (!bios_path || !bios_path[0]) {
-            error = "No BIOS could be resolved. Set a BIOS override file or a BIOS folder that contains the selected model.";
+            error = "未找到可用的 BIOS。请指定 BIOS 文件，或选择包含所选型号 BIOS 的文件夹。";
             return false;
+        }
+
+        {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(std::filesystem::path(bios_path), ec)) {
+                error = std::string("BIOS 文件不存在或无法访问：") + bios_path;
+                psxe_diag_logf("launch", "Resolved BIOS is unavailable: %s", bios_path);
+                return false;
+            }
+        }
+
+        const char* expansion = settings.exp_path.empty() ? nullptr : settings.exp_path.c_str();
+        if (expansion) {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(std::filesystem::path(expansion), ec)) {
+                error = std::string("扩展 ROM 文件不存在或无法访问：") + expansion;
+                psxe_diag_logf("launch", "Expansion ROM is unavailable: %s", expansion);
+                return false;
+            }
         }
 
         psx_ = psx_create();
         if (!psx_) {
-            error = "Failed to allocate a PSX session.";
+            error = "无法创建 PSX 会话。";
             return false;
         }
 
-        const char* expansion = settings.exp_path.empty() ? nullptr : settings.exp_path.c_str();
         const int init_result = psx_init(psx_, bios_path, expansion);
 
         if (init_result != 0) {
-            error = "Failed to initialize the emulator core. Check the BIOS and expansion ROM paths.";
+            error = "模拟器核心初始化失败。请检查 BIOS 和扩展 ROM 路径。";
             destroy();
             return false;
         }
 
         psx_cpu_set_execution_mode(psx_get_cpu(psx_), settings.cpu_engine);
+        psx_fastboot_set_enabled(request.kind == LaunchKind::Disc && settings.fast_boot);
+        if (request.kind == LaunchKind::Disc && settings.fast_boot) {
+            const bool patched = psx_fastboot_patch_bios(psx_get_bios(psx_)) != 0;
+            psxe_diag_logf("fastboot", "BIOS shell patch result=%s", patched ? "applied" : "unsupported-fallback");
+        }
         psxe_diag_logf("cpu", "execution engine=%s", CpuEngineSettingToken(settings.cpu_engine));
 
         psx_gpu_t* gpu = psx_get_gpu(psx_);
@@ -1968,7 +2018,7 @@ class ArmsxSession {
         pad_device_ = psxi_sda_create();
 
         if (!input_ || !pad_device_) {
-            error = "Failed to create the controller input bridge.";
+            error = "无法创建控制器输入桥接。";
             destroy();
             return false;
         }
@@ -1986,13 +2036,14 @@ class ArmsxSession {
         switch (request.kind) {
             case LaunchKind::Disc:
                 if (psx_cdrom_open(psx_get_cdrom(psx_), request.path.string().c_str()) == 0) {
-                    error = "Failed to open the selected disc image.";
+                    error = "无法打开所选光盘镜像。";
                     destroy();
                     return false;
                 }
                 disc_path_ = request.path;
                 exe_path_.clear();
                 title_ = request.label.empty() ? StemToTitle(request.path) : request.label;
+
                 break;
 
             case LaunchKind::Exe:
@@ -2013,7 +2064,7 @@ class ArmsxSession {
 
             case LaunchKind::None:
             default:
-                error = "Invalid launch request.";
+                error = "启动请求无效。";
                 destroy();
                 return false;
         }
@@ -2262,15 +2313,18 @@ class ArmsxSession {
         return debug_view_;
     }
 
-    bool reset() {
-        if (!psx_) {
-            return false;
+    LaunchRequest currentLaunchRequest() const {
+        LaunchRequest request;
+        request.kind = launch_kind_;
+        request.label = title_;
+
+        if (launch_kind_ == LaunchKind::Disc) {
+            request.path = disc_path_;
+        } else if (launch_kind_ == LaunchKind::Exe) {
+            request.path = exe_path_;
         }
 
-        psxe_diag_breadcrumbf("Soft reset requested title=%s", title_.empty() ? "(none)" : title_.c_str());
-        setFastForwardEnabled(false);
-        psx_soft_reset(psx_);
-        return true;
+        return request;
     }
 
     bool swapDisc(const std::filesystem::path& path) {
@@ -2287,7 +2341,6 @@ class ArmsxSession {
         launch_kind_ = LaunchKind::Disc;
         title_ = StemToTitle(path);
         psxe_diag_breadcrumbf("Disc swapped path=%s", path.string().c_str());
-        psx_soft_reset(psx_);
         return true;
     }
 
@@ -2300,7 +2353,7 @@ class ArmsxSession {
 
         info.has_game = true;
         info.title = title_.empty() ? "ARMSX" : title_;
-        info.subtitle = launch_kind_ == LaunchKind::Bios ? "No disc inserted" : (disc_path_.empty() ? exe_path_.filename().string() : disc_path_.filename().string());
+        info.subtitle = launch_kind_ == LaunchKind::Bios ? "未插入光盘" : (disc_path_.empty() ? exe_path_.filename().string() : disc_path_.filename().string());
         info.title_id = NormalizeModel(info.title);
         info.path = launch_kind_ == LaunchKind::Bios ? std::filesystem::path("bios://boot") : (disc_path_.empty() ? exe_path_ : disc_path_);
         return info;
@@ -2308,11 +2361,11 @@ class ArmsxSession {
 
     std::vector<fsui::OverlayTextLine> settingsOverlayLines(const FrontendSettings& settings) const {
         std::vector<fsui::OverlayTextLine> lines;
-        lines.push_back(fsui::OverlayTextLine{.text = std::string("Aspect: ") + AspectTitle(settings.display_aspect)});
-        lines.push_back(fsui::OverlayTextLine{.text = std::string("Video: ") + RendererValueTitle(settings)});
+        lines.push_back(fsui::OverlayTextLine{.text = std::string("宽高比：") + AspectTitle(settings.display_aspect)});
+        lines.push_back(fsui::OverlayTextLine{.text = std::string("画面：") + RendererValueTitle(settings)});
         lines.push_back(fsui::OverlayTextLine{.text = std::string("VSync: ") + BoolTitle(settings.vsync_enabled)});
-        lines.push_back(fsui::OverlayTextLine{.text = std::string("Debug View: ") + BoolTitle(debug_view_)});
-        lines.push_back(fsui::OverlayTextLine{.text = std::string("Fast Forward: ") + (fast_forward_enabled_ ? "2x" : "Off")});
+        lines.push_back(fsui::OverlayTextLine{.text = std::string("调试视图：") + BoolTitle(debug_view_)});
+        lines.push_back(fsui::OverlayTextLine{.text = std::string("快进：") + (fast_forward_enabled_ ? "2x" : "关")});
         return lines;
     }
 
@@ -2320,15 +2373,8 @@ class ArmsxSession {
         (void)settings;
         std::vector<fsui::OverlayTextLine> lines;
         char fps[64] = {};
-        char video[64] = {};
         std::snprintf(fps, sizeof(fps), "FPS: %.1f", ImGui::GetIO().Framerate);
-        std::snprintf(video, sizeof(video), "Video: %dx%d", texture_width_, texture_height_);
         lines.push_back(fsui::OverlayTextLine{.text = fps});
-        lines.push_back(fsui::OverlayTextLine{.text = video});
-        lines.push_back(fsui::OverlayTextLine{.text = std::string("State: ") + (paused_ ? "Paused" : "Running")});
-        if (fast_forward_enabled_) {
-            lines.push_back(fsui::OverlayTextLine{.text = "Speed: 2x"});
-        }
         return lines;
     }
 
@@ -3386,6 +3432,14 @@ class ImGuiMobileControls {
                 suppress_mouse_until_up_ = true;
             } else {
                 last_activity_ms_ = SDL_GetTicks();
+                const ImVec2 display = ImGui::GetIO().DisplaySize;
+                if (display.x > 0.0f && display.y > 0.0f) {
+                    const Layout layout = makeLayout(display);
+                    if (pointInRect(ImVec2(static_cast<float>(event.button.x), static_cast<float>(event.button.y)), layout.pause)) {
+                        pause_requested_ = true;
+                        suppress_mouse_until_up_ = true;
+                    }
+                }
             }
             return;
         }
@@ -3423,22 +3477,45 @@ class ImGuiMobileControls {
             return;
         }
 
-        const Touch next{
-            .id = event.tfinger.fingerId,
-            .x = std::clamp(event.tfinger.x, 0.0f, 1.0f),
-            .y = std::clamp(event.tfinger.y, 0.0f, 1.0f),
-        };
-        if (found == touches_.end()) {
+        const float x = std::clamp(event.tfinger.x, 0.0f, 1.0f);
+        const float y = std::clamp(event.tfinger.y, 0.0f, 1.0f);
+        if (found != touches_.end()) {
+            found->x = x;
+            found->y = y;
+            return;
+        }
+
+        if (event.type == SDL_FINGERDOWN) {
+            const ImVec2 display = ImGui::GetIO().DisplaySize;
+            if (display.x <= 0.0f || display.y <= 0.0f) {
+                return;
+            }
+
+            Touch next{
+                .id = event.tfinger.fingerId,
+                .x = x,
+                .y = y,
+            };
+            captureTouch(next, makeLayout(display), ImVec2(x * display.x, y * display.y));
+            if (next.kind == TouchKind::Pause) {
+                pause_requested_ = true;
+            }
             touches_.push_back(next);
-        } else {
-            *found = next;
         }
     }
 
     void reset(GameplayInputRouter& input) {
         touches_.clear();
+        suppressed_touches_.clear();
         routed_mask_ = 0;
+        pause_requested_ = false;
         input.setVirtualDigitalMask(0);
+    }
+
+    bool takePauseRequest() {
+        const bool requested = pause_requested_;
+        pause_requested_ = false;
+        return requested;
     }
 
     void showNow() {
@@ -3481,7 +3558,11 @@ class ImGuiMobileControls {
         const Layout layout = makeLayout(display);
         uint32_t mask = 0;
         for (const Touch& touch : touches_) {
-            mask |= maskForPoint(layout, ImVec2(touch.x * display.x, touch.y * display.y));
+            if (touch.kind == TouchKind::Stick) {
+                mask |= stickMaskForPoint(layout, ImVec2(touch.x * display.x, touch.y * display.y));
+            } else if (touch.kind == TouchKind::DigitalButton) {
+                mask |= touch.mask;
+            }
         }
 
         ImGuiIO& io = ImGui::GetIO();
@@ -3495,10 +3576,19 @@ class ImGuiMobileControls {
     }
 
   private:
+    enum class TouchKind {
+        None,
+        Stick,
+        DigitalButton,
+        Pause,
+    };
+
     struct Touch {
         SDL_FingerID id = 0;
         float x = 0.0f;
         float y = 0.0f;
+        TouchKind kind = TouchKind::None;
+        uint32_t mask = 0;
     };
 
     struct Button {
@@ -3521,6 +3611,7 @@ class ImGuiMobileControls {
         float stick_deadzone = 0.0f;
         std::array<Button, 4> face{};
         std::array<RectButton, 6> utility{};
+        RectButton pause{};
     };
 
     static Layout makeLayout(const ImVec2& display) {
@@ -3559,6 +3650,14 @@ class ImGuiMobileControls {
             RectButton{ImVec2(display.x * 0.5f - pill_width - shoulder_gap * 0.5f, pill_y), ImVec2(display.x * 0.5f - shoulder_gap * 0.5f, pill_y + pill_height), PSXI_SW_SDA_SELECT, "SELECT"},
             RectButton{ImVec2(display.x * 0.5f + shoulder_gap * 0.5f, pill_y), ImVec2(display.x * 0.5f + pill_width + shoulder_gap * 0.5f, pill_y + pill_height), PSXI_SW_SDA_START, "START"},
         };
+        const float pause_width = unit * 0.15f;
+        const float pause_height = unit * 0.075f;
+        layout.pause = RectButton{
+            ImVec2(display.x * 0.5f - pause_width * 0.5f, edge),
+            ImVec2(display.x * 0.5f + pause_width * 0.5f, edge + pause_height),
+            0,
+            ICON_FA_PAUSE,
+        };
         return layout;
     }
 
@@ -3573,16 +3672,51 @@ class ImGuiMobileControls {
             point.y >= button.min.y && point.y <= button.max.y;
     }
 
+    static uint32_t stickMaskForPoint(const Layout& layout, const ImVec2& point) {
+        uint32_t mask = 0;
+        const float dx = point.x - layout.stick_center.x;
+        const float dy = point.y - layout.stick_center.y;
+        if (dx <= -layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_LEFT;
+        if (dx >= layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_RIGHT;
+        if (dy <= -layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_UP;
+        if (dy >= layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_DOWN;
+        return mask;
+    }
+
+    static void captureTouch(Touch& touch, const Layout& layout, const ImVec2& point) {
+        if (pointInRect(point, layout.pause)) {
+            touch.kind = TouchKind::Pause;
+            return;
+        }
+
+        const float stick_hit_radius = layout.stick_radius * 1.35f;
+        if (distanceSquared(point, layout.stick_center) <= stick_hit_radius * stick_hit_radius) {
+            touch.kind = TouchKind::Stick;
+            return;
+        }
+
+        for (const Button& button : layout.face) {
+            const float hit_radius = button.radius * 1.35f;
+            if (distanceSquared(point, button.center) <= hit_radius * hit_radius) {
+                touch.kind = TouchKind::DigitalButton;
+                touch.mask = button.mask;
+                return;
+            }
+        }
+        for (const RectButton& button : layout.utility) {
+            if (pointInRect(point, button)) {
+                touch.kind = TouchKind::DigitalButton;
+                touch.mask = button.mask;
+                return;
+            }
+        }
+    }
+
     static uint32_t maskForPoint(const Layout& layout, const ImVec2& point) {
         uint32_t mask = 0;
         const float stick_hit_radius = layout.stick_radius * 1.35f;
         if (distanceSquared(point, layout.stick_center) <= stick_hit_radius * stick_hit_radius) {
-            const float dx = point.x - layout.stick_center.x;
-            const float dy = point.y - layout.stick_center.y;
-            if (dx <= -layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_LEFT;
-            if (dx >= layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_RIGHT;
-            if (dy <= -layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_UP;
-            if (dy >= layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_DOWN;
+            mask |= stickMaskForPoint(layout, point);
         }
 
         for (const Button& button : layout.face) {
@@ -3694,6 +3828,15 @@ class ImGuiMobileControls {
                 button.label
             );
         }
+
+        draw_list->AddRectFilled(layout.pause.min, layout.pause.max, panel, 10.0f);
+        draw_list->AddRect(layout.pause.min, layout.pause.max, outline, 10.0f, 0, 2.0f);
+        drawCenteredText(
+            draw_list,
+            ImVec2((layout.pause.min.x + layout.pause.max.x) * 0.5f, (layout.pause.min.y + layout.pause.max.y) * 0.5f),
+            IM_COL32(245, 247, 252, 235),
+            layout.pause.label
+        );
     }
 
     std::vector<Touch> touches_;
@@ -3703,6 +3846,7 @@ class ImGuiMobileControls {
     bool visible_ = true;
     bool controller_in_use_ = false;
     bool suppress_mouse_until_up_ = false;
+    bool pause_requested_ = false;
 };
 
 class ArmsxApp {
@@ -3712,6 +3856,11 @@ class ArmsxApp {
           external_renderer_(static_cast<SDL_Renderer*>(external_renderer)), cli_(ScanCliFlags(argc, argv)) {}
 
     int run() {
+#if defined(IOS_TARGET)
+        psxe_diag_set_enabled(1);
+        log_set_level(LOG_INFO);
+        log_set_quiet(0);
+#endif
         psxe_diag_initialize(psxe_cfg_get_pref_path());
         psxe_diag_breadcrumbf("ARMSX startup argc=%d", argc_);
         psxe_diag_logf("diag", "Pref path: %s", psxe_cfg_get_pref_path() ? psxe_cfg_get_pref_path() : "(none)");
@@ -3775,7 +3924,7 @@ class ArmsxApp {
             if (pending_cli_launch_.has_value()) {
                 launchSession(*pending_cli_launch_, false);
             } else if (!pending_cli_argument_.empty()) {
-                pending_error_dialog_ = "Unsupported launch path or URI.";
+                pending_error_dialog_ = "不支持此启动路径或 URI。";
             }
         }
 
@@ -3869,7 +4018,7 @@ class ArmsxApp {
 #endif
     }
 
-    void queueLaunchArgument(std::string_view argument, bool close_ui, const char* error_message = "Unsupported launch path or URI.") {
+    void queueLaunchArgument(std::string_view argument, bool close_ui, const char* error_message = "不支持此启动路径或 URI。") {
         const LaunchRequest request = LaunchForArgument(argument);
         psxe_diag_logf("launch", "Launch argument=%s kind=%s", std::string(argument).c_str(), LaunchKindTitle(request.kind));
         if (request.kind == LaunchKind::None) {
@@ -4008,7 +4157,7 @@ class ArmsxApp {
     void refreshFileSelectorRoots() {
         std::vector<ImGuiFullscreen::FileSelectorRootEntry> roots{
             ImGuiFullscreen::FileSelectorRootEntry{
-                .title = "App Folder",
+                .title = "ARMSX 文件夹",
                 .path = DefaultBrowseDirectory().string(),
             },
         };
@@ -4130,11 +4279,11 @@ class ArmsxApp {
         owns_renderer_ = false;
 
         if (!createManagedRenderer(desired_vsync)) {
-            return restore_previous_renderer("renderer-recreate-recover", "Failed to apply the requested VSync mode; restored the previous renderer.");
+            return restore_previous_renderer("renderer-recreate-recover", "无法应用所选 VSync 模式，已恢复之前的渲染器。");
         }
 
         if (!initializeFsui()) {
-            return restore_previous_renderer("renderer-recreate-recover", "Failed to rebuild the UI after changing VSync; restored the previous renderer.");
+            return restore_previous_renderer("renderer-recreate-recover", "更改 VSync 后无法重建界面，已恢复之前的渲染器。");
         }
 
         if (had_session) {
@@ -4299,7 +4448,12 @@ class ArmsxApp {
     }
 
     void applyLoggingSettings(const char* reason) {
+#if defined(IOS_TARGET)
+        settings_.logging_enabled = true;
+        const bool enable_logs = true;
+#else
         const bool enable_logs = settings_.logging_enabled;
+#endif
         settings_.quiet = !enable_logs;
 
         if (!enable_logs && psxe_diag_is_enabled()) {
@@ -4487,6 +4641,14 @@ class ArmsxApp {
         const Uint32 required = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER;
         psxe_diag_breadcrumbf("Initializing SDL subsystems flags=0x%x", required);
 
+        // Keep SDL's touch-to-mouse bridge enabled on iOS.  Some iOS SDL
+        // backends expose primary touches as mouse events only; disabling
+        // this makes the frontend appear completely non-interactive on
+        // affected devices.  Multi-touch game input is still handled through
+        // SDL_FINGER* events when available.
+        SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+        SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "1");
+
         if (SDL_WasInit(0) == 0) {
             owns_sdl_ = true;
             if (SDL_Init(required) != 0) {
@@ -4623,6 +4785,9 @@ class ArmsxApp {
         context.app_icon_path = ResolveFsuiAppIconPath();
         context.platform_backend = fsui::PlatformBackendKind::SDL2;
         context.renderer_backend = fsui::RendererBackend::SDLRenderer;
+#if defined(__ANDROID__) || defined(IOS_TARGET)
+        context.default_prompt_icon_pack = fsui::PromptIconPack::PlayStation;
+#endif
 
         fsui::Host host;
         host.ui_state = &settings_.ui_state;
@@ -4654,8 +4819,7 @@ class ArmsxApp {
         };
         host.reset_system = [this]() {
             if (session_.valid()) {
-                session_.reset();
-                resetFramePacing("fsui-reset");
+                restartCurrentSession("fsui-host-reset");
             }
         };
         host.exit_to_library = [this]() { exitToLibrary(); };
@@ -4748,7 +4912,8 @@ class ArmsxApp {
             psx_exp2_atcons_put(session_.psx()->exp2, 13);
         }
 
-        if (session_.valid() && !fsui_active && input_router_.takePauseRequest()) {
+        const bool mobile_pause = settings_.mobile_controls && mobile_controls_.takePauseRequest();
+        if (session_.valid() && !fsui_active && (input_router_.takePauseRequest() || mobile_pause)) {
             openPauseMenu();
         }
     }
@@ -4870,6 +5035,7 @@ class ArmsxApp {
 
             case fsui::CommandType::Resume:
                 if (session_.valid()) {
+                    fsui::ReturnToMainWindow();
                     ui_window_state_ = FsuiWindowState::None;
                     session_.setPaused(false);
                     resetFramePacing("command-resume");
@@ -4878,9 +5044,7 @@ class ArmsxApp {
 
             case fsui::CommandType::Reset:
                 if (session_.valid()) {
-                    session_.reset();
-                    session_.setPaused(false);
-                    resetFramePacing("command-reset");
+                    restartCurrentSession("fsui-command-reset");
                 }
                 break;
 
@@ -4918,9 +5082,7 @@ class ArmsxApp {
         if (deferred_reset_) {
             deferred_reset_ = false;
             if (session_.valid()) {
-                session_.reset();
-                session_.setPaused(false);
-                resetFramePacing("deferred-reset");
+                restartCurrentSession("settings-reset");
             }
         }
 
@@ -4934,7 +5096,7 @@ class ArmsxApp {
             }
 
             if (!session_.swapDisc(path)) {
-                pending_error_dialog_ = "Failed to swap to the selected disc image.";
+                pending_error_dialog_ = "无法换入所选光盘镜像。";
             } else {
                 session_.setPaused(false);
                 resetFramePacing("change-disc");
@@ -4953,10 +5115,10 @@ class ArmsxApp {
                 char name[64] = {};
                 std::strftime(name, sizeof(name), "armsx-%Y%m%d-%H%M%S.bmp", std::localtime(&now));
                 if (!session_.saveScreenshot(snap_dir / name)) {
-                    pending_error_dialog_ = "Failed to write the screenshot.";
+                    pending_error_dialog_ = "无法写入截图文件。";
                 }
             } catch (...) {
-                pending_error_dialog_ = "Failed to prepare the screenshot folder.";
+                pending_error_dialog_ = "无法创建截图文件夹。";
             }
         }
 
@@ -5000,6 +5162,40 @@ class ArmsxApp {
             returnToMainWindow();
         }
 
+        return true;
+    }
+
+    bool restartCurrentSession(const char* reason) {
+        if (!session_.valid()) {
+            return false;
+        }
+
+        const LaunchRequest request = session_.currentLaunchRequest();
+        if (request.kind == LaunchKind::None ||
+            ((request.kind == LaunchKind::Disc || request.kind == LaunchKind::Exe) && request.path.empty())) {
+            psxe_diag_logf("ui", "Full reset rejected: incomplete launch request reason=%s",
+                reason ? reason : "(unknown)");
+            return false;
+        }
+
+        psxe_diag_breadcrumbf("Full session reset requested reason=%s kind=%s path=%s",
+            reason ? reason : "(unknown)",
+            LaunchKindTitle(request.kind),
+            request.path.empty() ? "(none)" : request.path.string().c_str());
+
+        input_router_.detach();
+        if (!launchSession(request, true)) {
+            psxe_diag_logf("ui", "Full session reset failed reason=%s kind=%s path=%s",
+                reason ? reason : "(unknown)",
+                LaunchKindTitle(request.kind),
+                request.path.empty() ? "(none)" : request.path.string().c_str());
+            return false;
+        }
+
+        psxe_diag_logf("ui", "Full session reset completed reason=%s kind=%s path=%s",
+            reason ? reason : "(unknown)",
+            LaunchKindTitle(request.kind),
+            request.path.empty() ? "(none)" : request.path.string().c_str());
         return true;
     }
 
@@ -5124,13 +5320,13 @@ class ArmsxApp {
 
                     const int region = RegionFromSettings(settings_);
                     if (region == CDR_REGION_EUROPE) {
-                        entry.region = "Europe";
+                        entry.region = "欧洲";
                         entry.region_flag_path = "icons/flags/eu.png";
                     } else if (region == CDR_REGION_JAPAN) {
-                        entry.region = "Japan";
+                        entry.region = "日本";
                         entry.region_flag_path = "icons/flags/jp.png";
                     } else {
-                        entry.region = "North America";
+                        entry.region = "北美";
                         entry.region_flag_path = "icons/flags/us.png";
                     }
 
@@ -5158,7 +5354,7 @@ class ArmsxApp {
             add_scan_root(root, true);
         }
 
-#if defined(UWP_TARGET)
+#if defined(UWP_TARGET) || defined(IOS_TARGET)
         add_scan_root(DefaultBrowseDirectory(), true);
 #endif
 
@@ -5194,13 +5390,13 @@ class ArmsxApp {
 
             const int region = RegionFromSettings(settings_);
             if (region == CDR_REGION_EUROPE) {
-                entry.region = "Europe";
+                entry.region = "欧洲";
                 entry.region_flag_path = "icons/flags/eu.png";
             } else if (region == CDR_REGION_JAPAN) {
-                entry.region = "Japan";
+                entry.region = "日本";
                 entry.region_flag_path = "icons/flags/jp.png";
             } else {
-                entry.region = "North America";
+                entry.region = "北美";
                 entry.region_flag_path = "icons/flags/us.png";
             }
             game_list_.push_back(std::move(entry));
@@ -5220,32 +5416,32 @@ class ArmsxApp {
         fsui::MenuItemDescriptor game_list;
         game_list.id = "game-list";
         game_list.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::GameList);
-        game_list.title = "Game List";
-        game_list.summary = "Browse your library folders and open a game.";
+        game_list.title = "游戏列表";
+        game_list.summary = "浏览游戏目录并启动游戏。";
         game_list.on_activate = [this]() { showGameListWindow(); };
         items.push_back(std::move(game_list));
 
         fsui::MenuItemDescriptor start;
         start.id = "start-game";
         start.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::StartGame);
-        start.title = "Start Game";
-        start.summary = "Boot a disc, PS-X EXE, or the BIOS directly.";
+        start.title = "启动游戏";
+        start.summary = "直接启动光盘镜像、PS-X EXE 或 BIOS。";
         start.on_activate = [this]() { showStartGameWindow(); };
         items.push_back(std::move(start));
 
         fsui::MenuItemDescriptor settings;
         settings.id = "settings";
         settings.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::Settings);
-        settings.title = "Settings";
-        settings.summary = "Adjust ARMSX, BIOS, video, and library settings.";
+        settings.title = "设置";
+        settings.summary = "调整 ARMSX、BIOS、画面和游戏库选项。";
         settings.on_activate = [this]() { switchToSettingsWindow(); };
         items.push_back(std::move(settings));
 
         fsui::MenuItemDescriptor exit;
         exit.id = "exit";
         exit.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::Exit);
-        exit.title = "Exit";
-        exit.summary = "Quit ARMSX.";
+        exit.title = "退出";
+        exit.summary = "关闭 ARMSX。";
         exit.on_activate = [this]() { showExitWindow(); };
         items.push_back(std::move(exit));
 
@@ -5260,14 +5456,14 @@ class ArmsxApp {
         fsui::MenuItemDescriptor start_file;
         start_file.id = "start-file";
         start_file.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::StartFile);
-        start_file.title = "Start File";
-        start_file.summary = "Choose a disc image or PS-X EXE from your files.";
+        start_file.title = "选择文件启动";
+        start_file.summary = "从文件中选择光盘镜像或 PS-X EXE。";
         start_file.on_activate = [this, default_dir]() {
 #if defined(__EMSCRIPTEN__)
             requestWebFiles(false);
 #else
             ImGuiFullscreen::OpenFileSelector(
-                "Start File",
+                "选择启动文件",
                 false,
                 [this](const std::string& path) {
                     queueLaunchSelection(path);
@@ -5287,7 +5483,7 @@ class ArmsxApp {
             fsui::MenuItemDescriptor start_saved_exe;
             start_saved_exe.id = "start-default-exe";
             start_saved_exe.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::StartFile);
-            start_saved_exe.title = "Start Saved PS-X EXE";
+            start_saved_exe.title = "启动已保存的 PS-X EXE";
             start_saved_exe.summary = settings_.default_exe_path;
             start_saved_exe.on_activate = [this]() {
                 deferred_launch_ = LaunchRequest{
@@ -5303,14 +5499,14 @@ class ArmsxApp {
         fsui::MenuItemDescriptor start_disc;
         start_disc.id = "start-disc";
         start_disc.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::StartDisc);
-        start_disc.title = "Start Disc";
-        start_disc.summary = "Pick a disc image directly.";
+        start_disc.title = "启动光盘";
+        start_disc.summary = "直接选择一个光盘镜像。";
         start_disc.on_activate = [this, default_dir]() {
 #if defined(__EMSCRIPTEN__)
             requestWebFiles(false);
 #else
             ImGuiFullscreen::OpenFileSelector(
-                "Start Disc",
+                "选择光盘镜像",
                 false,
                 [this](const std::string& path) {
                     queueLaunchSelection(path, LaunchKind::Disc);
@@ -5330,8 +5526,8 @@ class ArmsxApp {
         fsui::MenuItemDescriptor start_folder;
         start_folder.id = "start-web-folder";
         start_folder.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::StartFile);
-        start_folder.title = "Open Game Folder";
-        start_folder.summary = "Grant temporary access to a folder and start a discovered game.";
+        start_folder.title = "打开游戏文件夹";
+        start_folder.summary = "临时授权访问文件夹并启动其中发现的游戏。";
         start_folder.on_activate = [this]() { requestWebFiles(true); };
         items.push_back(std::move(start_folder));
 #endif
@@ -5339,8 +5535,8 @@ class ArmsxApp {
         fsui::MenuItemDescriptor start_bios;
         start_bios.id = "start-bios";
         start_bios.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::StartBios);
-        start_bios.title = "Start BIOS";
-        start_bios.summary = "Boot into the BIOS without media.";
+        start_bios.title = "启动 BIOS";
+        start_bios.summary = "不插入光盘，直接进入 BIOS。";
         start_bios.on_activate = [this]() {
             deferred_launch_ = LaunchRequest{.kind = LaunchKind::Bios, .path = {}, .label = "PlayStation BIOS"};
             close_ui_after_launch_ = true;
@@ -5350,8 +5546,8 @@ class ArmsxApp {
         fsui::MenuItemDescriptor back;
         back.id = "back";
         back.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::Back);
-        back.title = "Back";
-        back.summary = "Return to the main menu.";
+        back.title = "返回";
+        back.summary = "返回主菜单。";
         back.on_activate = [this]() { showLandingWindow(); };
         items.push_back(std::move(back));
 
@@ -5364,16 +5560,16 @@ class ArmsxApp {
         fsui::MenuItemDescriptor quit;
         quit.id = "quit";
         quit.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::Exit);
-        quit.title = "Quit";
-        quit.summary = "Close ARMSX.";
+        quit.title = "退出";
+        quit.summary = "关闭 ARMSX。";
         quit.command = fsui::MakeRequestQuitCommand();
         items.push_back(std::move(quit));
 
         fsui::MenuItemDescriptor back;
         back.id = "back";
         back.icon_path = fsui::GetBuiltInStartupIconPath(fsui::BuiltInStartupIcon::Back);
-        back.title = "Back";
-        back.summary = "Return to the main menu.";
+        back.title = "返回";
+        back.summary = "返回主菜单。";
         back.on_activate = [this]() { showLandingWindow(); };
         items.push_back(std::move(back));
 
@@ -5385,25 +5581,25 @@ class ArmsxApp {
 
         fsui::MenuItemDescriptor resume;
         resume.id = "resume";
-        resume.title = ICON_FA_PLAY " Resume";
-        resume.summary = "Return to gameplay.";
+        resume.title = ICON_FA_PLAY " 继续游戏";
+        resume.summary = "返回游戏。";
         resume.command = fsui::MakeResumeCommand();
         items.push_back(std::move(resume));
 
         fsui::MenuItemDescriptor reset;
         reset.id = "reset";
-        reset.title = ICON_FA_SYNC " Reset";
-        reset.summary = "Soft-reset the active session.";
+        reset.title = ICON_FA_SYNC " 重置";
+        reset.summary = "软重置当前游戏。";
         reset.command = fsui::MakeResetCommand();
         items.push_back(std::move(reset));
 
         fsui::MenuItemDescriptor change_disc;
         change_disc.id = "change-disc";
-        change_disc.title = ICON_FA_COMPACT_DISC " Change Disc";
-        change_disc.summary = "Swap to another disc image and resume.";
+        change_disc.title = ICON_FA_COMPACT_DISC " 更换光盘";
+        change_disc.summary = "换入其他光盘镜像并继续游戏。";
         change_disc.on_activate = [this]() {
             ImGuiFullscreen::OpenFileSelector(
-                "Change Disc",
+                "更换光盘",
                 false,
                 [this](const std::string& path) { queueDiscSwapSelection(path); },
                 {".cue", ".bin", ".iso", ".img",
@@ -5418,31 +5614,31 @@ class ArmsxApp {
 
         fsui::MenuItemDescriptor screenshot;
         screenshot.id = "screenshot";
-        screenshot.title = ICON_FA_CAMERA " Save Screenshot";
-        screenshot.summary = "Save a BMP screenshot to the screenshot folder.";
+        screenshot.title = ICON_FA_CAMERA " 保存截图";
+        screenshot.summary = "将 BMP 截图保存到截图文件夹。";
         screenshot.on_activate = [this]() { deferred_screenshot_ = true; };
         items.push_back(std::move(screenshot));
 
         fsui::MenuItemDescriptor settings;
         settings.id = "settings";
-        settings.title = ICON_FA_SLIDERS_H " Settings";
-        settings.summary = "Open the in-game settings pages.";
+        settings.title = ICON_FA_SLIDERS_H " 设置";
+        settings.summary = "打开游戏内设置。";
         settings.on_activate = [this]() { switchToSettingsWindow(); };
         items.push_back(std::move(settings));
 
         fsui::MenuItemDescriptor fast_forward;
         fast_forward.id = "fast-forward";
-        fast_forward.title = ICON_FA_FAST_FORWARD " Fast Forward";
+        fast_forward.title = ICON_FA_FAST_FORWARD " 快进";
         fast_forward.summary = session_.fastForwardEnabled()
-            ? "Current speed is 2x. Click to return to normal speed and resume gameplay."
-            : "Current speed is normal. Click to resume gameplay at 2x.";
+            ? "当前速度为 2 倍。点击恢复正常速度并继续游戏。"
+            : "当前为正常速度。点击以 2 倍速度继续游戏。";
         fast_forward.on_activate = [this]() { deferred_fast_forward_toggle_ = true; };
         items.push_back(std::move(fast_forward));
 
         fsui::MenuItemDescriptor quit;
         quit.id = "quit-game";
-        quit.title = ICON_FA_POWER_OFF " Quit Game";
-        quit.summary = "Close the current game and return to the main menu.";
+        quit.title = ICON_FA_POWER_OFF " 退出游戏";
+        quit.summary = "关闭当前游戏并返回主菜单。";
         quit.command = fsui::MakeExitToLibraryCommand();
         items.push_back(std::move(quit));
 
@@ -5491,8 +5687,8 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor model;
             model.kind = fsui::SettingsRowKind::Choice;
             model.id = "model";
-            model.title = ICON_FA_MICROCHIP " Model";
-            model.summary = "Choose which BIOS model to use when a BIOS folder contains more than one.";
+            model.title = ICON_FA_MICROCHIP " BIOS 型号";
+            model.summary = "当 BIOS 文件夹中有多个文件时，选择优先使用的型号。";
             model.value = settings_.model;
             model.dialog_title = model.title;
             model.choices = BuildModelChoices(settings_.model);
@@ -5508,15 +5704,15 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor folder;
             folder.kind = fsui::SettingsRowKind::Action;
             folder.id = "bios-folder";
-            folder.title = ICON_FA_FOLDER " BIOS Folder";
+            folder.title = ICON_FA_FOLDER " BIOS 文件夹";
             if (settings_.bios_search.empty()) {
-                folder.summary = AppendBrowseRootHint("Choose a folder that contains BIOS files.");
+                folder.summary = AppendBrowseRootHint("选择包含 BIOS 文件的文件夹。");
             } else {
                 folder.summary = settings_.bios_search;
             }
             folder.on_activate = [this]() {
                 ImGuiFullscreen::OpenFileSelector(
-                    "BIOS Folder",
+                    "选择 BIOS 文件夹",
                     true,
                     [this](const std::string& path) {
                         if (const std::optional<std::string> selection = NormalizedPickerSelection(path)) {
@@ -5533,12 +5729,12 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor override;
             override.kind = fsui::SettingsRowKind::Action;
             override.id = "bios-override";
-            override.title = ICON_FA_FILE " BIOS Override";
-            override.summary = settings_.bios_override.empty() ? "Auto-select from the BIOS folder." : settings_.bios_override;
+            override.title = ICON_FA_FILE " 指定 BIOS 文件";
+            override.summary = settings_.bios_override.empty() ? "从 BIOS 文件夹中自动选择。" : settings_.bios_override;
             override.on_activate = [this]() {
                 const std::string browse_seed = settings_.bios_override.empty() ? settings_.bios_search : settings_.bios_override;
                 ImGuiFullscreen::OpenFileSelector(
-                    "BIOS Override",
+                    "指定 BIOS 文件",
                     false,
                     [this](const std::string& path) {
                         if (const std::optional<std::string> selection = NormalizedPickerSelection(path)) {
@@ -5555,8 +5751,8 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor clear_override;
             clear_override.kind = fsui::SettingsRowKind::Action;
             clear_override.id = "clear-bios-override";
-            clear_override.title = ICON_FA_TIMES " Clear BIOS Override";
-            clear_override.summary = "Fall back to the BIOS folder + preferred model.";
+            clear_override.title = ICON_FA_TIMES " 清除指定 BIOS";
+            clear_override.summary = "恢复按 BIOS 文件夹和首选型号自动选择。";
             clear_override.enabled = !settings_.bios_override.empty();
             clear_override.on_activate = [this]() {
                 settings_.bios_override.clear();
@@ -5578,8 +5774,8 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor cpu_engine;
             cpu_engine.kind = fsui::SettingsRowKind::Choice;
             cpu_engine.id = "cpu-engine";
-            cpu_engine.title = ICON_FA_MICROCHIP " CPU Engine";
-            cpu_engine.summary = "Use the cached interpreter for normal play or the reference interpreter for compatibility diagnostics. Applies on the next launch.";
+            cpu_engine.title = ICON_FA_MICROCHIP " CPU 引擎";
+            cpu_engine.summary = "正常游玩建议使用缓存解释器；兼容性排查可使用参考解释器。下次启动游戏时生效。";
             cpu_engine.value = CpuEngineTitle(settings_.cpu_engine);
             cpu_engine.dialog_title = cpu_engine.title;
             cpu_engine.choices = BuildCpuEngineChoices(settings_.cpu_engine);
@@ -5589,11 +5785,23 @@ class ArmsxApp {
             };
             rows.push_back(std::move(cpu_engine));
 
+            fsui::SettingsRowDescriptor fast_boot;
+            fast_boot.kind = fsui::SettingsRowKind::Toggle;
+            fast_boot.id = "fast-boot";
+            fast_boot.title = ICON_FA_BOLT " Fast Boot（快速启动）";
+            fast_boot.summary = "BIOS 完成系统初始化后跳过 PlayStation 开机动画。如游戏必须完整运行 BIOS 启动流程，请关闭此项。";
+            fast_boot.toggle_value = settings_.fast_boot;
+            fast_boot.on_toggle = [this](bool value) {
+                settings_.fast_boot = value;
+                SaveSettings(settings_);
+            };
+            rows.push_back(std::move(fast_boot));
+
             fsui::SettingsRowDescriptor region;
             region.kind = fsui::SettingsRowKind::Choice;
             region.id = "region";
-            region.title = ICON_FA_GLOBE " Region";
-            region.summary = "Choose which region the console should use when starting a disc.";
+            region.title = ICON_FA_GLOBE " 主机区域";
+            region.summary = "选择启动光盘时使用的主机区域。";
             region.value = ToLower(settings_.region);
             region.dialog_title = region.title;
             region.choices = BuildRegionChoices(settings_.region);
@@ -5609,11 +5817,11 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor expansion;
             expansion.kind = fsui::SettingsRowKind::Action;
             expansion.id = "expansion-rom";
-            expansion.title = ICON_FA_MEMORY " Expansion ROM";
-            expansion.summary = settings_.exp_path.empty() ? "No expansion ROM selected." : settings_.exp_path;
+            expansion.title = ICON_FA_MEMORY " 扩展 ROM";
+            expansion.summary = settings_.exp_path.empty() ? "尚未选择扩展 ROM。" : settings_.exp_path;
             expansion.on_activate = [this]() {
                 ImGuiFullscreen::OpenFileSelector(
-                    "Expansion ROM",
+                    "选择扩展 ROM",
                     false,
                     [this](const std::string& path) {
                         if (const std::optional<std::string> selection = NormalizedPickerSelection(path)) {
@@ -5630,11 +5838,11 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor default_exe;
             default_exe.kind = fsui::SettingsRowKind::Action;
             default_exe.id = "default-exe";
-            default_exe.title = ICON_FA_FILE_CODE " Default PS-X EXE";
-            default_exe.summary = settings_.default_exe_path.empty() ? "No default executable selected." : settings_.default_exe_path;
+            default_exe.title = ICON_FA_FILE_CODE " 默认 PS-X EXE";
+            default_exe.summary = settings_.default_exe_path.empty() ? "尚未选择默认可执行文件。" : settings_.default_exe_path;
             default_exe.on_activate = [this]() {
                 ImGuiFullscreen::OpenFileSelector(
-                    "Default PS-X EXE",
+                    "选择默认 PS-X EXE",
                     false,
                     [this](const std::string& path) {
                         if (const std::optional<std::string> selection = NormalizedPickerSelection(path)) {
@@ -5670,26 +5878,26 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor browse_notice;
             browse_notice.kind = fsui::SettingsRowKind::Notice;
             browse_notice.id = "uwp-filesystem-roots";
-            browse_notice.title = ICON_FA_FOLDER_OPEN " Mounted Drives";
-            browse_notice.summary = "Drive roots are available in the file picker. Use Filesystem Roots or Parent Directory to switch drives.";
+            browse_notice.title = ICON_FA_FOLDER_OPEN " 已挂载位置";
+            browse_notice.summary = "文件选择器中可访问各存储根目录；使用“文件系统根目录”或“上级目录”切换位置。";
             rows.push_back(std::move(browse_notice));
 #endif
 
             fsui::SettingsRowDescriptor add_folder;
             add_folder.kind = fsui::SettingsRowKind::Action;
             add_folder.id = "add-folder";
-            add_folder.title = ICON_FA_FOLDER_PLUS " Add Library Folder";
+            add_folder.title = ICON_FA_FOLDER_PLUS " 添加游戏文件夹";
 #if defined(__ANDROID__) || defined(IOS_TARGET)
-            add_folder.summary = "Grant persistent access to one game directory using the system folder picker.";
+            add_folder.summary = "通过系统文件夹选择器永久授权访问一个游戏目录。";
 #else
-            add_folder.summary = AppendBrowseRootHint("Scan only the selected directory.");
+            add_folder.summary = AppendBrowseRootHint("只扫描所选目录。");
 #endif
             add_folder.on_activate = [this]() {
                 if (RequestPlatformLibraryDirectory(false)) {
                     return;
                 }
                 ImGuiFullscreen::OpenFileSelector(
-                    "Add Library Folder",
+                    "添加游戏文件夹",
                     true,
                     [this](const std::string& path) {
                         if (const std::optional<std::string> selection = NormalizedPickerSelection(path)) {
@@ -5707,18 +5915,18 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor add_recursive;
             add_recursive.kind = fsui::SettingsRowKind::Action;
             add_recursive.id = "add-recursive-folder";
-            add_recursive.title = ICON_FA_FOLDER_PLUS " Add Recursive Folder";
+            add_recursive.title = ICON_FA_FOLDER_PLUS " 添加递归扫描文件夹";
 #if defined(__ANDROID__) || defined(IOS_TARGET)
-            add_recursive.summary = "Grant persistent access to a game directory and scan all of its subfolders.";
+            add_recursive.summary = "永久授权访问游戏目录，并扫描其中所有子文件夹。";
 #else
-            add_recursive.summary = AppendBrowseRootHint("Scan the selected directory and its children.");
+            add_recursive.summary = AppendBrowseRootHint("扫描所选目录及其所有子目录。");
 #endif
             add_recursive.on_activate = [this]() {
                 if (RequestPlatformLibraryDirectory(true)) {
                     return;
                 }
                 ImGuiFullscreen::OpenFileSelector(
-                    "Add Recursive Library Folder",
+                    "添加递归扫描文件夹",
                     true,
                     [this](const std::string& path) {
                         if (const std::optional<std::string> selection = NormalizedPickerSelection(path)) {
@@ -5736,8 +5944,8 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor refresh;
             refresh.kind = fsui::SettingsRowKind::Action;
             refresh.id = "refresh-library";
-            refresh.title = ICON_FA_SYNC " Refresh Library";
-            refresh.summary = "Rescan every configured library folder.";
+            refresh.title = ICON_FA_SYNC " 刷新游戏库";
+            refresh.summary = "重新扫描所有已配置的游戏文件夹。";
             refresh.on_activate = [this]() { refreshGameList(true); };
             rows.push_back(std::move(refresh));
 
@@ -5747,7 +5955,7 @@ class ArmsxApp {
                     row.kind = fsui::SettingsRowKind::Action;
                     row.id = std::string(recursive ? "recursive-" : "folder-") + std::to_string(index);
                     row.title = WithHiddenId(
-                        recursive ? ICON_FA_FOLDER_OPEN " Recursive Folder" : ICON_FA_FOLDER " Library Folder",
+                        recursive ? ICON_FA_FOLDER_OPEN " 递归扫描文件夹" : ICON_FA_FOLDER " 游戏文件夹",
                         row.id
                     );
                     const std::string configured_path = folders[index].string();
@@ -5785,12 +5993,21 @@ class ArmsxApp {
         advanced_page.build_rows = [this]() {
             std::vector<fsui::SettingsRowDescriptor> rows;
 
+#if defined(IOS_TARGET)
+            fsui::SettingsRowDescriptor logging_status;
+            logging_status.kind = fsui::SettingsRowKind::Notice;
+            logging_status.id = "logging-status";
+            logging_status.title = ICON_FA_BUG " 模拟器日志";
+            logging_status.summary = "启动、PSX 核心、SDL 和游戏控制台输出始终写入日志文件。";
+            logging_status.value = "已开启";
+            rows.push_back(std::move(logging_status));
+#else
             fsui::SettingsRowDescriptor logging_enabled;
             logging_enabled.kind = fsui::SettingsRowKind::Toggle;
             logging_enabled.id = "logging-enabled";
-            logging_enabled.title = ICON_FA_BUG " Debug Logging";
+            logging_enabled.title = ICON_FA_BUG " 调试日志";
             logging_enabled.summary =
-                "Write diagnostic logs for troubleshooting only. Leave this off during normal play because it can reduce performance.";
+                "写入用于故障排查的诊断日志。正常游玩时建议关闭，以免影响性能。";
             logging_enabled.toggle_value = settings_.logging_enabled;
             logging_enabled.on_toggle = [this](bool value) {
                 settings_.logging_enabled = value;
@@ -5798,13 +6015,14 @@ class ArmsxApp {
                 SaveSettings(settings_);
             };
             rows.push_back(std::move(logging_enabled));
+#endif
 
             fsui::SettingsRowDescriptor mobile_controls;
             mobile_controls.kind = fsui::SettingsRowKind::Toggle;
             mobile_controls.id = "mobile-controls";
-            mobile_controls.title = ICON_FA_GAMEPAD " ImGui Mobile Controls";
+            mobile_controls.title = ICON_FA_GAMEPAD " 屏幕触控按键";
             mobile_controls.summary =
-                "Show the multitouch PlayStation controls during play. They hide after three seconds idle or when a controller is used, and reappear on touch.";
+                "游戏中显示支持多点触控的 PlayStation 按键。闲置三秒或使用实体手柄后自动隐藏，触摸屏幕时重新显示。";
             mobile_controls.toggle_value = settings_.mobile_controls;
             mobile_controls.on_toggle = [this](bool value) {
                 settings_.mobile_controls = value;
@@ -5821,8 +6039,8 @@ class ArmsxApp {
                 fsui::SettingsRowDescriptor log_level;
                 log_level.kind = fsui::SettingsRowKind::Choice;
                 log_level.id = "log-level";
-                log_level.title = ICON_FA_TERMINAL " Log Level";
-                log_level.summary = "Choose how much detail ARMSX writes to the debug log.";
+                log_level.title = ICON_FA_TERMINAL " 日志级别";
+                log_level.summary = "选择 ARMSX 写入调试日志的详细程度。";
                 log_level.value = log_level_string(settings_.log_level);
                 log_level.dialog_title = log_level.title;
                 log_level.choices = BuildLogLevelChoices(settings_.log_level);
@@ -5836,7 +6054,7 @@ class ArmsxApp {
                 fsui::SettingsRowDescriptor log_path;
                 log_path.kind = fsui::SettingsRowKind::Notice;
                 log_path.id = "log-path";
-                log_path.title = ICON_FA_FILE_ALT " Log File";
+                log_path.title = ICON_FA_FILE_ALT " 日志文件";
                 log_path.summary = diagnosticsLogPath().string();
                 rows.push_back(std::move(log_path));
             }
@@ -5844,7 +6062,7 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor settings_path;
             settings_path.kind = fsui::SettingsRowKind::Notice;
             settings_path.id = "settings-path";
-            settings_path.title = ICON_FA_FILE_ALT " Settings File";
+            settings_path.title = ICON_FA_FILE_ALT " 设置文件";
             settings_path.summary = settings_.settings_path;
             rows.push_back(std::move(settings_path));
 
@@ -5894,19 +6112,19 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor reset;
             reset.kind = fsui::SettingsRowKind::Action;
             reset.id = "reset-now";
-            reset.title = ICON_FA_SYNC " Reset";
-            reset.summary = "Soft-reset the active session.";
+            reset.title = ICON_FA_SYNC " 重置";
+            reset.summary = "软重置当前游戏。";
             reset.on_activate = [this]() { deferred_reset_ = true; };
             rows.push_back(std::move(reset));
 
             fsui::SettingsRowDescriptor disc;
             disc.kind = fsui::SettingsRowKind::Action;
             disc.id = "change-disc-now";
-            disc.title = ICON_FA_COMPACT_DISC " Change Disc";
-            disc.summary = "Swap to a different disc image.";
+            disc.title = ICON_FA_COMPACT_DISC " 更换光盘";
+            disc.summary = "换入其他光盘镜像。";
             disc.on_activate = [this]() {
                 ImGuiFullscreen::OpenFileSelector(
-                    "Change Disc",
+                    "更换光盘",
                     false,
                 [this](const std::string& path) { queueDiscSwapSelection(path); },
                 {".cue", ".bin", ".iso", ".img",
@@ -5922,16 +6140,16 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor screenshot;
             screenshot.kind = fsui::SettingsRowKind::Action;
             screenshot.id = "save-screenshot-now";
-            screenshot.title = ICON_FA_CAMERA " Save Screenshot";
-            screenshot.summary = "Write a BMP screenshot to the snapshot folder.";
+            screenshot.title = ICON_FA_CAMERA " 保存截图";
+            screenshot.summary = "将 BMP 截图写入截图文件夹。";
             screenshot.on_activate = [this]() { deferred_screenshot_ = true; };
             rows.push_back(std::move(screenshot));
 
             fsui::SettingsRowDescriptor exit_library;
             exit_library.kind = fsui::SettingsRowKind::Action;
             exit_library.id = "exit-library-now";
-            exit_library.title = ICON_FA_FOLDER_OPEN " Exit To Library";
-            exit_library.summary = "Close the current game and return to the main menu.";
+            exit_library.title = ICON_FA_FOLDER_OPEN " 返回游戏库";
+            exit_library.summary = "关闭当前游戏并返回主菜单。";
             exit_library.on_activate = [this]() { deferred_exit_to_library_ = true; };
             rows.push_back(std::move(exit_library));
 
@@ -5955,10 +6173,10 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor gpu_backend;
             gpu_backend.kind = fsui::SettingsRowKind::Choice;
             gpu_backend.id = "gpu-backend";
-            gpu_backend.title = ICON_FA_TACHOMETER_ALT " GPU Backend";
+            gpu_backend.title = ICON_FA_TACHOMETER_ALT " GPU 后端";
             gpu_backend.summary = hardwareRendererAvailable()
-                ? "Choose SDL software or accelerated presentation. PlayStation GPU rasterization remains accuracy-first in software. Applies on the next launch."
-                : "SDL renderer selection is controlled by the embedding host in this display mode.";
+                ? "选择 SDL 软件或加速显示。PlayStation GPU 光栅化仍采用精度优先的软件实现。下次启动游戏时生效。"
+                : "当前显示模式下，SDL 渲染器由宿主程序控制。";
             gpu_backend.value = GpuBackendTitle(settings_.gpu_backend);
             gpu_backend.dialog_title = gpu_backend.title;
             gpu_backend.choices = BuildGpuBackendChoices(settings_.gpu_backend);
@@ -5966,7 +6184,7 @@ class ArmsxApp {
             if (!gpu_backend.enabled) {
                 gpu_backend.availability = fsui::AvailabilityMode::Disabled;
                 gpu_backend.unavailable_title = gpu_backend.title;
-                gpu_backend.unavailable_message = "This embedding host owns the SDL renderer.";
+                gpu_backend.unavailable_message = "SDL 渲染器由当前宿主程序管理。";
             }
             gpu_backend.on_choice = [this](int index) {
                 settings_.gpu_backend = (index == 1) ? GpuBackend::SDLAccelerated : GpuBackend::Software;
@@ -5980,8 +6198,8 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor scale;
             scale.kind = fsui::SettingsRowKind::Choice;
             scale.id = "display-scale";
-            scale.title = ICON_FA_EXPAND " Display Scale";
-            scale.summary = "Resize the app window.";
+            scale.title = ICON_FA_EXPAND " 显示缩放";
+            scale.summary = "调整应用窗口大小。";
             scale.value = std::to_string(settings_.scale) + "x";
             scale.dialog_title = scale.title;
             scale.choices = BuildScaleChoices(settings_.scale);
@@ -6001,11 +6219,11 @@ class ArmsxApp {
         vsync.id = "vsync";
         vsync.title = ICON_FA_SYNC " VSync";
 #if defined(__EMSCRIPTEN__)
-        vsync.summary = "Synchronize presentation to the display refresh rate. The browser controls this on web builds.";
+        vsync.summary = "将画面显示与屏幕刷新率同步；网页版由浏览器控制。";
 #else
         vsync.summary = can_control_vsync
-            ? "Synchronize presentation to the display refresh rate to reduce tearing. This applies immediately."
-            : "Synchronize presentation to the display refresh rate. This renderer is host-controlled here.";
+            ? "将画面显示与屏幕刷新率同步，以减少撕裂。立即生效。"
+            : "将画面显示与屏幕刷新率同步；当前渲染器由宿主程序控制。";
 #endif
         vsync.toggle_value = settings_.vsync_enabled;
         vsync.enabled = can_control_vsync;
@@ -6020,8 +6238,8 @@ class ArmsxApp {
         fsui::SettingsRowDescriptor filter;
         filter.kind = fsui::SettingsRowKind::Toggle;
         filter.id = "texture-filter";
-        filter.title = ICON_FA_ADJUST " Texture Scaling / Bilinear";
-        filter.summary = "Use smoother filtering for the display output.";
+        filter.title = ICON_FA_ADJUST " 画面缩放 / 双线性过滤";
+        filter.summary = "对最终显示画面使用更平滑的缩放过滤。";
         filter.toggle_value = settings_.texture_scale_mode;
         filter.on_toggle = [this](bool value) {
             settings_.texture_scale_mode = value;
@@ -6032,9 +6250,9 @@ class ArmsxApp {
         fsui::SettingsRowDescriptor presentation_upscale;
         presentation_upscale.kind = fsui::SettingsRowKind::Choice;
         presentation_upscale.id = "presentation-upscale";
-        presentation_upscale.title = ICON_FA_MAGIC " SDL Quality Upscale";
+        presentation_upscale.title = ICON_FA_MAGIC " SDL 高质量放大";
         presentation_upscale.summary =
-            "Build a higher-resolution SDL presentation texture without changing PlayStation rasterization.";
+            "在不改变 PlayStation 光栅化精度的情况下，以更高分辨率生成 SDL 显示纹理。";
         presentation_upscale.value = std::to_string(settings_.presentation_upscale) + "x";
         presentation_upscale.dialog_title = presentation_upscale.title;
         presentation_upscale.choices = BuildPresentationUpscaleChoices(settings_.presentation_upscale);
@@ -6049,8 +6267,8 @@ class ArmsxApp {
         fsui::SettingsRowDescriptor stretch;
         stretch.kind = fsui::SettingsRowKind::Toggle;
         stretch.id = "stretch";
-        stretch.title = ICON_FA_EXPAND_ARROWS_ALT " Stretch";
-        stretch.summary = "Fill the window instead of preserving the original aspect ratio.";
+        stretch.title = ICON_FA_EXPAND_ARROWS_ALT " 拉伸填满屏幕";
+        stretch.summary = "填满整个屏幕，不保留原始宽高比。";
         stretch.toggle_value = settings_.stretch_mode;
         stretch.on_toggle = [this](bool value) {
             settings_.stretch_mode = value;
@@ -6061,8 +6279,8 @@ class ArmsxApp {
         fsui::SettingsRowDescriptor aspect;
         aspect.kind = fsui::SettingsRowKind::Choice;
         aspect.id = "aspect";
-        aspect.title = ICON_FA_TV " Display Aspect";
-        aspect.summary = "Choose the presentation aspect ratio.";
+        aspect.title = ICON_FA_TV " 显示宽高比";
+        aspect.summary = "选择画面的显示宽高比。";
         aspect.value = AspectTitle(settings_.display_aspect);
         aspect.dialog_title = aspect.title;
         aspect.choices = BuildAspectChoices(settings_.display_aspect);
@@ -6076,8 +6294,8 @@ class ArmsxApp {
         fsui::SettingsRowDescriptor upscale;
         upscale.kind = fsui::SettingsRowKind::Choice;
         upscale.id = "wide-upscale";
-        upscale.title = ICON_FA_EXPAND " Wide Upscale";
-        upscale.summary = "Choose the wide-mode output height.";
+        upscale.title = ICON_FA_EXPAND " 宽屏输出分辨率";
+        upscale.summary = "选择宽屏模式的输出高度。";
         upscale.value = UpscaleToString(settings_.upscale_height);
         upscale.dialog_title = upscale.title;
         upscale.choices = BuildUpscaleChoices(settings_.upscale_height);
@@ -6091,16 +6309,28 @@ class ArmsxApp {
         };
         rows.push_back(std::move(upscale));
 
+        fsui::SettingsRowDescriptor show_fps;
+        show_fps.kind = fsui::SettingsRowKind::Toggle;
+        show_fps.id = "show-fps";
+        show_fps.title = ICON_FA_TACHOMETER_ALT " 显示 FPS";
+        show_fps.summary = "游戏中在右上角显示当前画面帧率。";
+        show_fps.toggle_value = settings_.show_fps;
+        show_fps.on_toggle = [this](bool value) {
+            settings_.show_fps = value;
+            settings_.ui_state.show_performance_overlay = value;
+            SaveSettings(settings_);
+        };
+        rows.push_back(std::move(show_fps));
+
         fsui::SettingsRowDescriptor debug_panel;
         debug_panel.kind = fsui::SettingsRowKind::Toggle;
         debug_panel.id = "debug-panel";
-        debug_panel.title = ICON_FA_TACHOMETER_ALT " Debug Panel";
-        debug_panel.summary = "Show the settings and performance overlays.";
+        debug_panel.title = ICON_FA_TACHOMETER_ALT " 调试面板";
+        debug_panel.summary = "显示当前模拟器设置，供故障排查使用。";
         debug_panel.toggle_value = settings_.debug_panel;
         debug_panel.on_toggle = [this](bool value) {
             settings_.debug_panel = value;
             settings_.ui_state.show_settings_overlay = value;
-            settings_.ui_state.show_performance_overlay = value;
             SaveSettings(settings_);
         };
         rows.push_back(std::move(debug_panel));
@@ -6109,8 +6339,8 @@ class ArmsxApp {
             fsui::SettingsRowDescriptor debug_view;
             debug_view.kind = fsui::SettingsRowKind::Toggle;
             debug_view.id = "debug-view";
-            debug_view.title = ICON_FA_BUG " VRAM Debug View";
-            debug_view.summary = "Show raw VRAM instead of the game image.";
+            debug_view.title = ICON_FA_BUG " VRAM 调试视图";
+            debug_view.summary = "显示原始 VRAM，而不是游戏画面。";
             debug_view.toggle_value = session_.debugView();
             debug_view.on_toggle = [this](bool value) {
                 session_.setDebugView(value);

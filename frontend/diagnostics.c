@@ -249,7 +249,10 @@ void psxe_diag_initialize(const char* pref_path) {
     g_diag_log_path[0] = '\0';
     psxe_diag_load_run_tag();
 
-    if (pref_path && pref_path[0]) {
+    const char* explicit_log_path = getenv("ARMSX_DIAGNOSTICS_LOG_PATH");
+    if (explicit_log_path && explicit_log_path[0]) {
+        SDL_snprintf(g_diag_log_path, sizeof(g_diag_log_path), "%s", explicit_log_path);
+    } else if (pref_path && pref_path[0]) {
         char log_directory[1024] = {0};
         SDL_snprintf(log_directory, sizeof(log_directory), "%slogs", pref_path);
         psxe_diag_make_directory(log_directory);
