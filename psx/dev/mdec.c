@@ -384,6 +384,9 @@ void psx_mdec_write32(psx_mdec_t* mdec, uint32_t offset, uint32_t value) {
                     g_mdec_cmd_table[mdec->cmd >> 29](mdec);
 
                     free(mdec->input);
+                    mdec->input = NULL;
+                    mdec->input_size = 0;
+                    mdec->input_index = 0;
                 }
 
                 break;
@@ -485,6 +488,10 @@ void psx_mdec_write8(psx_mdec_t* mdec, uint32_t offset, uint8_t value) {
 }
 
 void psx_mdec_destroy(psx_mdec_t* mdec) {
+    if (!mdec)
+        return;
+    free(mdec->input);
+    free(mdec->output);
     free(mdec);
 }
 

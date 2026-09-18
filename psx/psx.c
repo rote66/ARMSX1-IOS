@@ -9,18 +9,6 @@ int psx_load_bios(psx_t* psx, const char* path) {
     return psx_bios_load(psx->bios, path);
 }
 
-void psx_load_state(psx_t* psx, const char* path) {
-    log_fatal("State saving/loading is not yet supported");
-
-    exit(1);
-}
-
-void psx_save_state(psx_t* psx, const char* path) {
-    log_fatal("State saving/loading is not yet supported");
-
-    exit(1);
-}
-
 void psx_load_exe(psx_t* psx, const char* path) {
     psx_exe_load(psx->cpu, path);
 }
