@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "EmulatorRunner.h"
 #import "armsx_bridge.h"
+#import <CoreMotion/CoreMotion.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <errno.h>
@@ -11,16 +12,22 @@
 #include <unistd.h>
 
 static NSString *const ARMSXLibraryBookmarksKey = @"ARMSXLibraryDirectoryBookmarks";
+static NSString *const ARMSXDebugLoggingMarkerName = @".armsx-debug-log-enabled";
 
 @interface AppDelegate () <UIDocumentPickerDelegate>
 @property (nonatomic, strong) EmulatorRunner *emulatorRunner;
 @property (nonatomic, copy) NSString *launchProtocolURL;
 @property (nonatomic, assign) BOOL pendingLibraryRecursive;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSURL *> *accessedLibraryURLs;
+@property (nonatomic, strong) CMMotionManager *gravityMotionManager;
+@property (nonatomic, strong) NSOperationQueue *gravityMotionQueue;
+@property (atomic, assign) UIInterfaceOrientation gravityInterfaceOrientation;
 - (void)presentLibraryDirectoryPickerRecursive:(BOOL)recursive;
 - (void)removePersistedLibraryDirectory:(NSString *)path;
 - (NSURL *)prepareSharedDocumentsDirectory;
 - (void)configureUnifiedLoggingAtDocumentsURL:(NSURL *)documentsURL;
+- (void)setGravityMotionEnabled:(BOOL)enabled;
+- (void)refreshGravityInterfaceOrientation;
 @end
 
 static void ARMSXRequestLibraryDirectory(int recursive, void *userdata) {
@@ -32,6 +39,18 @@ static void ARMSXRequestLibraryDirectory(int recursive, void *userdata) {
         present();
     } else {
         dispatch_async(dispatch_get_main_queue(), present);
+    }
+}
+
+static void ARMSXSetGravityMotionEnabled(int enabled, void *userdata) {
+    AppDelegate *delegate = (__bridge AppDelegate *)userdata;
+    void (^update)(void) = ^{
+        [delegate setGravityMotionEnabled:enabled != 0];
+    };
+    if (NSThread.isMainThread) {
+        update();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), update);
     }
 }
 
@@ -52,6 +71,90 @@ static void ARMSXRemoveLibraryDirectory(const char *path, void *userdata) {
 }
 
 @implementation AppDelegate
+
+- (void)refreshGravityInterfaceOrientation {
+    UIInterfaceOrientation orientation = UIInterfaceOrientationLandscapeRight;
+    if (@available(iOS 13.0, *)) {
+        UIInterfaceOrientation candidate = self.window.windowScene.interfaceOrientation;
+        if (candidate != UIInterfaceOrientationUnknown) {
+            orientation = candidate;
+        }
+    }
+    self.gravityInterfaceOrientation = orientation;
+}
+
+- (void)deviceOrientationDidChange:(NSNotification *)notification {
+    (void)notification;
+    UIDeviceOrientation deviceOrientation = UIDevice.currentDevice.orientation;
+    switch (deviceOrientation) {
+        case UIDeviceOrientationLandscapeLeft:
+            self.gravityInterfaceOrientation = UIInterfaceOrientationLandscapeRight;
+            break;
+        case UIDeviceOrientationLandscapeRight:
+            self.gravityInterfaceOrientation = UIInterfaceOrientationLandscapeLeft;
+            break;
+        case UIDeviceOrientationPortrait:
+            self.gravityInterfaceOrientation = UIInterfaceOrientationPortrait;
+            break;
+        case UIDeviceOrientationPortraitUpsideDown:
+            self.gravityInterfaceOrientation = UIInterfaceOrientationPortraitUpsideDown;
+            break;
+        default:
+            break;
+    }
+}
+
+- (void)setGravityMotionEnabled:(BOOL)enabled {
+    if (!enabled) {
+        [self.gravityMotionManager stopDeviceMotionUpdates];
+        psxe_set_gravity_sample(0.0f);
+        return;
+    }
+
+    if (!self.gravityMotionManager) {
+        self.gravityMotionManager = [CMMotionManager new];
+        self.gravityMotionManager.deviceMotionUpdateInterval = 1.0 / 60.0;
+    }
+    if (!self.gravityMotionQueue) {
+        self.gravityMotionQueue = [NSOperationQueue new];
+        self.gravityMotionQueue.name = @"ARMSX Gravity Motion";
+        self.gravityMotionQueue.qualityOfService = NSQualityOfServiceUserInteractive;
+        self.gravityMotionQueue.maxConcurrentOperationCount = 1;
+    }
+    if (!self.gravityMotionManager.deviceMotionAvailable || self.gravityMotionManager.deviceMotionActive) {
+        return;
+    }
+
+    [self refreshGravityInterfaceOrientation];
+    __weak AppDelegate *weakSelf = self;
+    [self.gravityMotionManager startDeviceMotionUpdatesToQueue:self.gravityMotionQueue
+                                                  withHandler:^(CMDeviceMotion *motion, NSError *error) {
+        (void)error;
+        AppDelegate *strongSelf = weakSelf;
+        if (!strongSelf || !motion) {
+            return;
+        }
+
+        const CMAcceleration gravity = motion.gravity;
+        float screenX = 0.0f;
+        switch (strongSelf.gravityInterfaceOrientation) {
+            case UIInterfaceOrientationLandscapeLeft:
+                screenX = (float)gravity.y;
+                break;
+            case UIInterfaceOrientationLandscapeRight:
+                screenX = (float)-gravity.y;
+                break;
+            case UIInterfaceOrientationPortraitUpsideDown:
+                screenX = (float)-gravity.x;
+                break;
+            case UIInterfaceOrientationPortrait:
+            default:
+                screenX = (float)gravity.x;
+                break;
+        }
+        psxe_set_gravity_sample(screenX);
+    }];
+}
 
 - (UIViewController *)topViewController {
     UIViewController *controller = self.window.rootViewController;
@@ -268,6 +371,13 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 
     NSURL *logURL = [documentsURL URLByAppendingPathComponent:@"armsx_log.txt" isDirectory:NO];
     const char *logPath = logURL.fileSystemRepresentation;
+    setenv("ARMSX_DIAGNOSTICS_LOG_PATH", logPath, 1);
+
+    NSURL *markerURL = [documentsURL URLByAppendingPathComponent:ARMSXDebugLoggingMarkerName isDirectory:NO];
+    if (![NSFileManager.defaultManager fileExistsAtPath:markerURL.path]) {
+        return;
+    }
+
     int logFD = open(logPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (logFD < 0) {
         NSLog(@"ARMSX could not open its unified log at %@: %s", logURL.path, strerror(errno));
@@ -282,8 +392,6 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
-    setenv("ARMSX_DIAGNOSTICS_LOG_PATH", logPath, 1);
-
     fprintf(
         stderr,
         "@@LOG_SINK@@ unified=1 path=%s pid=%d stdout=%d stderr=%d\n",
@@ -312,6 +420,12 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     self.window.rootViewController = rootViewController;
     [self.window makeKeyAndVisible];
     [self forceLandscapeIfNeeded];
+    [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(deviceOrientationDidChange:)
+                                                 name:UIDeviceOrientationDidChangeNotification
+                                               object:nil];
+    [self refreshGravityInterfaceOrientation];
     self.accessedLibraryURLs = [NSMutableDictionary dictionary];
 
     NSURL *documentsURL = [self prepareSharedDocumentsDirectory];
@@ -323,6 +437,10 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     );
     psxe_set_library_directory_removed_callback(
         ARMSXRemoveLibraryDirectory,
+        (__bridge void *)self
+    );
+    psxe_set_gravity_motion_enabled_callback(
+        ARMSXSetGravityMotionEnabled,
         (__bridge void *)self
     );
     [self restoreLibraryDirectories];
@@ -340,6 +458,10 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 
 - (void)applicationWillTerminate:(UIApplication *)application {
     (void)application;
+    [self setGravityMotionEnabled:NO];
+    psxe_set_gravity_motion_enabled_callback(NULL, NULL);
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIDeviceOrientationDidChangeNotification object:nil];
+    [UIDevice.currentDevice endGeneratingDeviceOrientationNotifications];
     for (NSURL *url in self.accessedLibraryURLs.allValues) {
         [url stopAccessingSecurityScopedResource];
     }

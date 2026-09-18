@@ -93,7 +93,7 @@ done
     -miphoneos-version-min="$DEPLOYMENT_TARGET" \
     "$OBJECT_ROOT/main.o" "$OBJECT_ROOT/AppDelegate.o" "$OBJECT_ROOT/EmulatorRunner.o" \
     "${REPO_ROOT}/ios/Frameworks/libarmsx.dylib" \
-    -F"$SDL_PARENT" -framework SDL2 -framework UIKit -framework Foundation \
+    -F"$SDL_PARENT" -framework SDL2 -framework UIKit -framework Foundation -framework CoreMotion \
     -framework UniformTypeIdentifiers -Wl,-rpath,@executable_path/Frameworks \
     -o "$APP_ROOT/ARMSX"
 

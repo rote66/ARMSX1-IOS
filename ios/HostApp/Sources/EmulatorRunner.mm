@@ -125,7 +125,12 @@
 
             argv.push_back(nullptr);
 
-            external_main((int)argvStorage.size(), argv.data(), NULL, NULL);
+            const int result = external_main((int)argvStorage.size(), argv.data(), NULL, NULL);
+            self.running = NO;
+            NSLog(@"ARMSX frontend returned with status %d; terminating app process.", result);
+            fflush(stdout);
+            fflush(stderr);
+            exit(result == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
         }
     });
 }
