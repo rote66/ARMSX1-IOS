@@ -3,6 +3,13 @@
 #import "armsx_bridge.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
 static NSString *const ARMSXLibraryBookmarksKey = @"ARMSXLibraryDirectoryBookmarks";
 
 @interface AppDelegate () <UIDocumentPickerDelegate>
@@ -12,6 +19,8 @@ static NSString *const ARMSXLibraryBookmarksKey = @"ARMSXLibraryDirectoryBookmar
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSURL *> *accessedLibraryURLs;
 - (void)presentLibraryDirectoryPickerRecursive:(BOOL)recursive;
 - (void)removePersistedLibraryDirectory:(NSString *)path;
+- (NSURL *)prepareSharedDocumentsDirectory;
+- (void)configureUnifiedLoggingAtDocumentsURL:(NSURL *)documentsURL;
 @end
 
 static void ARMSXRequestLibraryDirectory(int recursive, void *userdata) {
@@ -219,14 +228,94 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     });
 }
 
+- (NSURL *)prepareSharedDocumentsDirectory {
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSURL *documentsURL = [[fileManager URLsForDirectory:NSDocumentDirectory
+                                               inDomains:NSUserDomainMask] firstObject];
+    if (!documentsURL) {
+        NSLog(@"ARMSX could not locate its Documents directory.");
+        return nil;
+    }
+
+    NSError *error = nil;
+    if (![fileManager createDirectoryAtURL:documentsURL
+               withIntermediateDirectories:YES
+                                attributes:nil
+                                     error:&error]) {
+        NSLog(@"ARMSX could not create its Documents directory: %@", error);
+        return nil;
+    }
+
+    for (NSString *directoryName in @[@"Games", @"BIOS", @"Saves", @"Screenshots"]) {
+        NSURL *directoryURL = [documentsURL URLByAppendingPathComponent:directoryName isDirectory:YES];
+        error = nil;
+        if (![fileManager createDirectoryAtURL:directoryURL
+                   withIntermediateDirectories:YES
+                                    attributes:nil
+                                         error:&error]) {
+            NSLog(@"ARMSX could not create shared directory %@: %@", directoryName, error);
+        }
+    }
+
+    setenv("ARMSX_DOCUMENTS_DIR", documentsURL.fileSystemRepresentation, 1);
+    return documentsURL;
+}
+
+- (void)configureUnifiedLoggingAtDocumentsURL:(NSURL *)documentsURL {
+    if (!documentsURL) {
+        return;
+    }
+
+    NSURL *logURL = [documentsURL URLByAppendingPathComponent:@"armsx_log.txt" isDirectory:NO];
+    const char *logPath = logURL.fileSystemRepresentation;
+    int logFD = open(logPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    if (logFD < 0) {
+        NSLog(@"ARMSX could not open its unified log at %@: %s", logURL.path, strerror(errno));
+        return;
+    }
+
+    const int stderrResult = dup2(logFD, STDERR_FILENO);
+    const int stdoutResult = dup2(logFD, STDOUT_FILENO);
+    if (logFD != STDERR_FILENO && logFD != STDOUT_FILENO) {
+        close(logFD);
+    }
+
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setenv("ARMSX_DIAGNOSTICS_LOG_PATH", logPath, 1);
+
+    fprintf(
+        stderr,
+        "@@LOG_SINK@@ unified=1 path=%s pid=%d stdout=%d stderr=%d\n",
+        logPath,
+        getpid(),
+        stdoutResult >= 0 ? 1 : 0,
+        stderrResult >= 0 ? 1 : 0
+    );
+    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    NSString *bundleVersion = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"];
+    fprintf(
+        stderr,
+        "@@BUILD@@ bundle=%s version=%s\n",
+        bundleIdentifier.length ? bundleIdentifier.UTF8String : "(unknown)",
+        bundleVersion.length ? bundleVersion.UTF8String : "(unknown)"
+    );
+}
+
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     (void)application;
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.window.backgroundColor = [UIColor blackColor];
+    UIViewController *rootViewController = [UIViewController new];
+    rootViewController.view.backgroundColor = [UIColor blackColor];
+    self.window.rootViewController = rootViewController;
     [self.window makeKeyAndVisible];
     [self forceLandscapeIfNeeded];
     self.accessedLibraryURLs = [NSMutableDictionary dictionary];
+
+    NSURL *documentsURL = [self prepareSharedDocumentsDirectory];
+    [self configureUnifiedLoggingAtDocumentsURL:documentsURL];
 
     psxe_set_library_directory_picker_callback(
         ARMSXRequestLibraryDirectory,

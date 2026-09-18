@@ -151,7 +151,7 @@ prepare_ios_sdl_package() {
 
 if [ "$MODE" = "ios" ]; then
     IOS_SDK="${IOS_SDK:-iphoneos}"
-    IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-13.0}"
+    IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-14.0}"
     IOS_SDKROOT="$(xcrun --sdk "${IOS_SDK}" --show-sdk-path)"
     IOS_CC="$(xcrun --sdk "${IOS_SDK}" --find clang)"
     IOS_CXX="$(xcrun --sdk "${IOS_SDK}" --find clang++)"

@@ -1,7 +1,7 @@
 name: ARMSX
 options:
   deploymentTarget:
-    iOS: "15.1"
+    iOS: "14.0"
 settings:
   DEVELOPMENT_TEAM: ""
   CLANG_ENABLE_OBJC_ARC: YES
@@ -9,7 +9,7 @@ targets:
   ARMSX:
     type: application
     platform: iOS
-    deploymentTarget: "15.1"
+    deploymentTarget: "14.0"
     sources:
       - path: Sources
     resources:
@@ -22,6 +22,7 @@ targets:
       - path: ../../icon.icon
         optional: true
     settings:
+      CODE_SIGN_ENTITLEMENTS: Sources/ARMSX.entitlements
       INFOPLIST_FILE: Sources/Info.plist
       PRODUCT_BUNDLE_IDENTIFIER: com.nanodata.armsx
       LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"

@@ -23,6 +23,8 @@
 
     SDL_SetMainReady();
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "1");
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         NSLog(@"SDL_Init failed: %s", SDL_GetError());
