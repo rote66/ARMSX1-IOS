@@ -18,6 +18,8 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <cerrno>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,8 +29,12 @@
 #include <utility>
 #include <vector>
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(IOS_TARGET)
 #include <unistd.h>
+#endif
+
+#if defined(IOS_TARGET)
+#include <sys/mman.h>
 #endif
 
 #if defined(_WIN32)
@@ -73,6 +79,185 @@ extern "C" {
 #include "config.h"
 #include "toml.h"
 }
+
+std::filesystem::path DefaultTouchLayoutPath() {
+    const char* pref = psxe_cfg_get_pref_path();
+    if (pref && pref[0]) {
+        return std::filesystem::path(pref) / "touch-layout.layout";
+    }
+    return std::filesystem::path("touch-layout.layout");
+}
+
+std::filesystem::path SharedTouchLayoutPath() {
+    const char* documents = std::getenv("ARMSX_DOCUMENTS_DIR");
+    if (documents && documents[0]) {
+        return std::filesystem::path(documents) / "ARMSX-TouchLayout.layout";
+    }
+    const char* pref = psxe_cfg_get_pref_path();
+    return (pref && pref[0] ? std::filesystem::path(pref) : std::filesystem::current_path()) /
+        "ARMSX-TouchLayout.layout";
+}
+
+std::string SafeFileComponent(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_') {
+            out.push_back(static_cast<char>(ch));
+        } else if (ch == ' ' || ch == '.') {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) {
+        out = "game";
+    }
+    if (out.size() > 48) {
+        out.resize(48);
+    }
+    return out;
+}
+
+uint32_t Fnv1a32(std::string_view value) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char ch : value) {
+        hash ^= ch;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+#if defined(IOS_TARGET)
+std::filesystem::path IosDebugLoggingMarkerPath() {
+    const char* documents = std::getenv("ARMSX_DOCUMENTS_DIR");
+    if (documents && documents[0]) {
+        return std::filesystem::path(documents) / ".armsx-debug-log-enabled";
+    }
+    const char* pref = psxe_cfg_get_pref_path();
+    return (pref && pref[0] ? std::filesystem::path(pref) : std::filesystem::current_path()) /
+        ".armsx-debug-log-enabled";
+}
+
+bool IosDebugLoggingRequested() {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(IosDebugLoggingMarkerPath(), ec);
+}
+
+bool SetIosDebugLoggingRequested(bool enabled) {
+    const std::filesystem::path marker = IosDebugLoggingMarkerPath();
+    std::error_code ec;
+    if (!enabled) {
+        std::filesystem::remove(marker, ec);
+        return !ec;
+    }
+
+    std::ofstream out(marker, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out << "1\n";
+    return static_cast<bool>(out);
+}
+
+struct JitRuntimeStatus {
+    bool available = false;
+    std::string value;
+    std::string detail;
+};
+
+JitRuntimeStatus QueryJitRuntimeStatus() {
+    const long sys_page_size = sysconf(_SC_PAGESIZE);
+    const size_t page_size = sys_page_size > 0 ? static_cast<size_t>(sys_page_size) : 16384u;
+
+    int rwx_error = 0;
+    errno = 0;
+    void* rwx = mmap(
+        nullptr,
+        page_size,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANON,
+        -1,
+        0
+    );
+    const bool rwx_ok = rwx != MAP_FAILED;
+    if (rwx_ok) {
+        munmap(rwx, page_size);
+    } else {
+        rwx_error = errno;
+    }
+
+    int protect_error = 0;
+    errno = 0;
+    void* wx = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    bool protect_ok = false;
+    if (wx != MAP_FAILED) {
+        errno = 0;
+        protect_ok = mprotect(wx, page_size, PROT_READ | PROT_EXEC) == 0;
+        if (!protect_ok) {
+            protect_error = errno;
+        }
+        munmap(wx, page_size);
+    } else {
+        protect_error = errno;
+    }
+
+    bool map_jit_ok = false;
+    int map_jit_error = 0;
+#if defined(MAP_JIT)
+    errno = 0;
+    void* map_jit = mmap(
+        nullptr,
+        page_size,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANON | MAP_JIT,
+        -1,
+        0
+    );
+    map_jit_ok = map_jit != MAP_FAILED;
+    if (map_jit_ok) {
+        munmap(map_jit, page_size);
+    } else {
+        map_jit_error = errno;
+    }
+#else
+    map_jit_error = ENOTSUP;
+#endif
+
+    const bool available = rwx_ok || protect_ok || map_jit_ok;
+
+    auto probeText = [](bool ok, int error) {
+        if (ok) {
+            return std::string("成功");
+        }
+        if (!error) {
+            return std::string("失败");
+        }
+        return std::string("失败(") + std::strerror(error) + ")";
+    };
+
+    const std::string detail_text =
+        std::string("运行时内存能力：RWX=") + probeText(rwx_ok, rwx_error) +
+        "，RW→RX=" + probeText(protect_ok, protect_error) +
+        "，MAP_JIT=" + probeText(map_jit_ok, map_jit_error) +
+        "。任一成功即可支持常见 JIT 可执行内存路径。全部失败时仅表示当前探测未确认。";
+
+    psxe_diag_logf(
+        "jit",
+        "runtime status=%s rwx=%s rwx_errno=%d protect-rx=%s protect_errno=%d map-jit=%s map_jit_errno=%d",
+        available ? "available" : "not-detected",
+        rwx_ok ? "true" : "false",
+        rwx_error,
+        protect_ok ? "true" : "false",
+        protect_error,
+        map_jit_ok ? "true" : "false",
+        map_jit_error
+    );
+    return {
+        available,
+        available ? "可用" : "未确认",
+        detail_text
+    };
+}
+#endif
 
 #include "archive.h"
 #include "IconsFontAwesome5.h"
@@ -146,6 +331,7 @@ struct PlatformLibraryGame {
 
 using PlatformDirectoryPickerCallback = void (*)(int recursive, void* userdata);
 using PlatformDirectoryRemovedCallback = void (*)(const char* path, void* userdata);
+using GravityMotionEnabledCallback = void (*)(int enabled, void* userdata);
 
 std::mutex g_platform_library_lock;
 std::vector<PlatformLibraryRoot> g_platform_library_roots;
@@ -155,6 +341,9 @@ PlatformDirectoryPickerCallback g_platform_directory_picker_callback = nullptr;
 void* g_platform_directory_picker_userdata = nullptr;
 PlatformDirectoryRemovedCallback g_platform_directory_removed_callback = nullptr;
 void* g_platform_directory_removed_userdata = nullptr;
+GravityMotionEnabledCallback g_gravity_motion_enabled_callback = nullptr;
+void* g_gravity_motion_enabled_userdata = nullptr;
+std::atomic<float> g_gravity_screen_x{0.0f};
 
 constexpr double kUiFrameRate = 60.0;
 constexpr Uint32 kMobileControlsAutoHideMs = 3000;
@@ -524,6 +713,15 @@ void NotifyPlatformLibraryDirectoryRemoved(std::string_view path) {
     }
 }
 
+void NotifyPlatformGravityMotionEnabled(bool enabled) {
+    if (g_gravity_motion_enabled_callback) {
+        g_gravity_motion_enabled_callback(enabled ? 1 : 0, g_gravity_motion_enabled_userdata);
+    }
+    if (!enabled) {
+        g_gravity_screen_x.store(0.0f, std::memory_order_relaxed);
+    }
+}
+
 struct FrontendSettings {
     std::string settings_path;
     std::string bios_override;
@@ -550,6 +748,9 @@ struct FrontendSettings {
     int upscale_height = 480;
     int presentation_upscale = 1;
     bool mobile_controls = DefaultMobileControlsEnabled();
+    bool gravity_left_stick_enabled = false;
+    float gravity_left_stick_deadzone = 0.05f;
+    float gravity_left_stick_sensitivity = 1.0f;
     fsui::UiState ui_state{
         .theme = "Dark",
         .prompt_icon_pack = fsui::PromptIconPack::Auto,
@@ -1414,6 +1615,54 @@ std::vector<fsui::SettingsChoiceOption> BuildLogLevelChoices(int current_level) 
     return BuildChoices(labels, clamped);
 }
 
+std::vector<float> GravityDeadzoneValues() {
+    return {0.0f, 0.025f, 0.05f, 0.075f, 0.10f, 0.15f, 0.20f, 0.25f};
+}
+
+std::vector<float> GravitySensitivityValues() {
+    return {0.25f, 0.50f, 0.75f, 1.00f, 1.25f, 1.50f, 1.75f, 2.00f};
+}
+
+int ClosestFloatChoice(const std::vector<float>& values, float current) {
+    int best = 0;
+    float best_distance = std::numeric_limits<float>::max();
+    for (size_t index = 0; index < values.size(); ++index) {
+        const float distance = std::abs(values[index] - current);
+        if (distance < best_distance) {
+            best = static_cast<int>(index);
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
+std::string GravityDeadzoneTitle(float value) {
+    const int percent = static_cast<int>(std::lround(value * 100.0f));
+    return std::to_string(percent) + "%";
+}
+
+std::string GravitySensitivityTitle(float value) {
+    char text[16] = {};
+    std::snprintf(text, sizeof(text), "%.2fx", value);
+    return text;
+}
+
+std::vector<fsui::SettingsChoiceOption> BuildGravityDeadzoneChoices(float current) {
+    const std::vector<float> values = GravityDeadzoneValues();
+    std::vector<std::string> labels;
+    labels.reserve(values.size());
+    for (float value : values) labels.push_back(GravityDeadzoneTitle(value));
+    return BuildChoices(labels, ClosestFloatChoice(values, current));
+}
+
+std::vector<fsui::SettingsChoiceOption> BuildGravitySensitivityChoices(float current) {
+    const std::vector<float> values = GravitySensitivityValues();
+    std::vector<std::string> labels;
+    labels.reserve(values.size());
+    for (float value : values) labels.push_back(GravitySensitivityTitle(value));
+    return BuildChoices(labels, ClosestFloatChoice(values, current));
+}
+
 std::time_t FileTimeToTimeT(const std::filesystem::file_time_type& value) {
     using namespace std::chrono;
     const auto adjusted = time_point_cast<system_clock::duration>(
@@ -1674,6 +1923,21 @@ void LoadExtraSettings(FrontendSettings& settings, const CliFlags& cli) {
         if (mobile_controls.ok) {
             settings.mobile_controls = mobile_controls.u.b != 0;
         }
+
+        toml_datum_t gravity_enabled = toml_bool_in(input, "gravity_left_stick_enabled");
+        if (gravity_enabled.ok) {
+            settings.gravity_left_stick_enabled = gravity_enabled.u.b != 0;
+        }
+
+        toml_datum_t gravity_deadzone = toml_double_in(input, "gravity_left_stick_deadzone");
+        if (gravity_deadzone.ok) {
+            settings.gravity_left_stick_deadzone = std::clamp(static_cast<float>(gravity_deadzone.u.d), 0.0f, 0.25f);
+        }
+
+        toml_datum_t gravity_sensitivity = toml_double_in(input, "gravity_left_stick_sensitivity");
+        if (gravity_sensitivity.ok) {
+            settings.gravity_left_stick_sensitivity = std::clamp(static_cast<float>(gravity_sensitivity.u.d), 0.25f, 2.0f);
+        }
     }
 
     if (toml_table_t* library = toml_table_in(root, "library")) {
@@ -1843,7 +2107,10 @@ bool SaveSettings(const FrontendSettings& settings) {
         << "    display_aspect = \"" << AspectToString(settings.display_aspect) << "\"\n"
         << "    wide_upscale = \"" << UpscaleToString(settings.upscale_height) << "\"\n\n"
         << "[input]\n"
-        << "    mobile_controls = " << (settings.mobile_controls ? "true" : "false") << "\n\n"
+        << "    mobile_controls = " << (settings.mobile_controls ? "true" : "false") << "\n"
+        << "    gravity_left_stick_enabled = " << (settings.gravity_left_stick_enabled ? "true" : "false") << "\n"
+        << "    gravity_left_stick_deadzone = " << settings.gravity_left_stick_deadzone << "\n"
+        << "    gravity_left_stick_sensitivity = " << settings.gravity_left_stick_sensitivity << "\n\n"
         << "[library]\n"
         << "    folders = ";
     write_path_array(settings.ui_state.game_list_paths);
@@ -2341,6 +2608,32 @@ class ArmsxSession {
         launch_kind_ = LaunchKind::Disc;
         title_ = StemToTitle(path);
         psxe_diag_breadcrumbf("Disc swapped path=%s", path.string().c_str());
+        return true;
+    }
+
+    bool saveState(const std::filesystem::path& path) {
+        if (!psx_ || path.empty()) {
+            return false;
+        }
+        if (psx_save_state(psx_, path.string().c_str()) == 0) {
+            return false;
+        }
+        psxe_diag_breadcrumbf("Quick state saved path=%s", path.string().c_str());
+        return true;
+    }
+
+    bool loadState(const std::filesystem::path& path) {
+        if (!psx_ || path.empty()) {
+            return false;
+        }
+        setFastForwardEnabled(false);
+        clearQueuedAudio();
+        if (psx_load_state(psx_, path.string().c_str()) == 0) {
+            return false;
+        }
+        texture_snapshot_.clear();
+        vblank_counter_ = 0;
+        psxe_diag_breadcrumbf("Quick state loaded path=%s", path.string().c_str());
         return true;
     }
 
@@ -2997,6 +3290,12 @@ class GameplayInputRouter {
 
     void attach(psx_pad_t* pad) {
         clearAll();
+        gravity_left_stick_enabled_ = false;
+        gravity_forced_analog_mode_ = false;
+        gravity_left_stick_x_ = 0.0f;
+        gravity_saved_model_ = SDA_MODEL_DIGITAL;
+        gravity_saved_prev_model_ = SDA_MODEL_DIGITAL;
+        gravity_saved_sa_mode_ = SA_MODE_DIGITAL;
         pad_ = pad;
     }
 
@@ -3043,6 +3342,20 @@ class GameplayInputRouter {
 
     uint32_t activeDigitalMask() const {
         return active_digital_mask_;
+    }
+
+    void setGravityLeftStick(float x, bool enabled) {
+        x = std::clamp(x, -1.0f, 1.0f);
+        if (enabled != gravity_left_stick_enabled_) {
+            if (enabled) {
+                ensureGravityAnalogMode();
+            } else {
+                restoreGravityAnalogMode();
+            }
+            gravity_left_stick_enabled_ = enabled;
+        }
+        gravity_left_stick_x_ = enabled ? x : 0.0f;
+        applyGravityLeftStick();
     }
 
     void tick(bool fsui_active) {
@@ -3350,6 +3663,52 @@ class GameplayInputRouter {
         psx_pad_analog_change(pad_, 0, PSXI_AX_SDA_LEFT_VERT, 0x80);
     }
 
+    psxi_sda_t* playerOneSda() const {
+        if (!pad_ || !pad_->joy_slot[0] || !pad_->joy_slot[0]->udata) {
+            return nullptr;
+        }
+        return static_cast<psxi_sda_t*>(pad_->joy_slot[0]->udata);
+    }
+
+    void ensureGravityAnalogMode() {
+        psxi_sda_t* sda = playerOneSda();
+        if (!sda || sda->sa_mode == SA_MODE_ANALOG) {
+            gravity_forced_analog_mode_ = false;
+            return;
+        }
+        gravity_saved_model_ = sda->model;
+        gravity_saved_prev_model_ = sda->prev_model;
+        gravity_saved_sa_mode_ = sda->sa_mode;
+        sda->prev_model = sda->model;
+        sda->model = SDA_MODEL_ANALOG_PAD;
+        sda->sa_mode = SA_MODE_ANALOG;
+        gravity_forced_analog_mode_ = true;
+    }
+
+    void restoreGravityAnalogMode() {
+        psxi_sda_t* sda = playerOneSda();
+        if (gravity_forced_analog_mode_ && sda) {
+            sda->model = gravity_saved_model_;
+            sda->prev_model = gravity_saved_prev_model_;
+            sda->sa_mode = gravity_saved_sa_mode_;
+        }
+        gravity_forced_analog_mode_ = false;
+        if (pad_) {
+            psx_pad_analog_change(pad_, 0, PSXI_AX_SDA_LEFT_HORZ, 0x80);
+            psx_pad_analog_change(pad_, 0, PSXI_AX_SDA_LEFT_VERT, 0x80);
+        }
+    }
+
+    void applyGravityLeftStick() {
+        if (!pad_) {
+            return;
+        }
+        const float x = gravity_left_stick_enabled_ && !fsui_owns_input_ ? gravity_left_stick_x_ : 0.0f;
+        const int mapped = std::clamp(static_cast<int>(std::lround((x + 1.0f) * 127.5f)), 0, 255);
+        psx_pad_analog_change(pad_, 0, PSXI_AX_SDA_LEFT_HORZ, static_cast<uint16_t>(mapped));
+        psx_pad_analog_change(pad_, 0, PSXI_AX_SDA_LEFT_VERT, 0x80);
+    }
+
 #ifdef CONTROLLER_GENERIC
     void handleTrigger(uint32_t mask, bool& down_flag, Sint16 value) {
         const bool pressed = value > 8000;
@@ -3421,11 +3780,104 @@ class GameplayInputRouter {
     bool trigger_right_down_ = false;
     bool controller_activity_ = false;
     bool controller_disconnected_ = false;
+    bool gravity_left_stick_enabled_ = false;
+    bool gravity_forced_analog_mode_ = false;
+    float gravity_left_stick_x_ = 0.0f;
+    uint8_t gravity_saved_model_ = SDA_MODEL_DIGITAL;
+    uint8_t gravity_saved_prev_model_ = SDA_MODEL_DIGITAL;
+    int gravity_saved_sa_mode_ = SA_MODE_DIGITAL;
 };
 
 class ImGuiMobileControls {
+    enum class ControlElement : size_t {
+        Stick = 0,
+        Triangle,
+        Circle,
+        Cross,
+        Square,
+        L2,
+        L1,
+        R2,
+        R1,
+        Select,
+        Start,
+        Pause,
+        Count,
+    };
+
+    struct ControlTransform {
+        float x = -1.0f;
+        float y = -1.0f;
+        float scale = 1.0f;
+    };
+
+    struct EditorTouch {
+        SDL_FingerID id = 0;
+        ImVec2 point{};
+    };
+
   public:
+    void configureLayoutFiles(std::filesystem::path persistent, std::filesystem::path exchange) {
+        persistent_layout_path_ = std::move(persistent);
+        exchange_layout_path_ = std::move(exchange);
+        loadLayout(persistent_layout_path_);
+    }
+
+    void beginLayoutEditor() {
+        editing_ = true;
+        editor_finished_ = false;
+        selected_element_ = -1;
+        editor_touches_.clear();
+        touches_.clear();
+        suppressed_touches_.clear();
+        visible_ = true;
+        suppress_mouse_until_up_ = false;
+        pause_requested_ = false;
+    }
+
+    bool editing() const {
+        return editing_;
+    }
+
+    bool takeEditorFinished() {
+        const bool finished = editor_finished_;
+        editor_finished_ = false;
+        return finished;
+    }
+
+    bool stickTouchActive() const {
+        return stick_touch_active_;
+    }
+
+    void setGravityVisualX(float x) {
+        gravity_visual_x_ = std::clamp(x, -1.0f, 1.0f);
+    }
+
+    bool resetLayoutToDefaults() {
+        transforms_.fill(ControlTransform{});
+        return persistent_layout_path_.empty() || saveLayout(persistent_layout_path_);
+    }
+
+    bool exportLayout() const {
+        return !exchange_layout_path_.empty() && saveLayout(exchange_layout_path_);
+    }
+
+    bool importLayout() {
+        if (exchange_layout_path_.empty() || !loadLayout(exchange_layout_path_)) {
+            return false;
+        }
+        return persistent_layout_path_.empty() || saveLayout(persistent_layout_path_);
+    }
+
+    const std::filesystem::path& exchangeLayoutPath() const {
+        return exchange_layout_path_;
+    }
+
     void processEvent(const SDL_Event& event) {
+        if (editing_) {
+            processEditorEvent(event);
+            return;
+        }
         if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
             if (!visible_) {
                 showNow();
@@ -3509,6 +3961,7 @@ class ImGuiMobileControls {
         suppressed_touches_.clear();
         routed_mask_ = 0;
         pause_requested_ = false;
+        stick_touch_active_ = false;
         input.setVirtualDigitalMask(0);
     }
 
@@ -3535,6 +3988,14 @@ class ImGuiMobileControls {
     }
 
     void drawAndRoute(GameplayInputRouter& input) {
+        if (editing_) {
+            input.setVirtualDigitalMask(0);
+            const ImVec2 display = ImGui::GetIO().DisplaySize;
+            if (display.x > 0.0f && display.y > 0.0f) {
+                drawEditor(makeLayout(display));
+            }
+            return;
+        }
         const Uint32 now = SDL_GetTicks();
         if (last_activity_ms_ == 0) {
             last_activity_ms_ = now;
@@ -3557,8 +4018,10 @@ class ImGuiMobileControls {
 
         const Layout layout = makeLayout(display);
         uint32_t mask = 0;
+        stick_touch_active_ = false;
         for (const Touch& touch : touches_) {
             if (touch.kind == TouchKind::Stick) {
+                stick_touch_active_ = true;
                 mask |= stickMaskForPoint(layout, ImVec2(touch.x * display.x, touch.y * display.y));
             } else if (touch.kind == TouchKind::DigitalButton) {
                 mask |= touch.mask;
@@ -3614,7 +4077,23 @@ class ImGuiMobileControls {
         RectButton pause{};
     };
 
-    static Layout makeLayout(const ImVec2& display) {
+    static ImVec2 rectCenter(const RectButton& rect) {
+        return ImVec2((rect.min.x + rect.max.x) * 0.5f, (rect.min.y + rect.max.y) * 0.5f);
+    }
+
+    static void applyRectTransform(RectButton& rect, const ControlTransform& transform, const ImVec2& display) {
+        const ImVec2 default_center = rectCenter(rect);
+        const float width = (rect.max.x - rect.min.x) * transform.scale;
+        const float height = (rect.max.y - rect.min.y) * transform.scale;
+        const ImVec2 center(
+            transform.x >= 0.0f ? transform.x * display.x : default_center.x,
+            transform.y >= 0.0f ? transform.y * display.y : default_center.y
+        );
+        rect.min = ImVec2(center.x - width * 0.5f, center.y - height * 0.5f);
+        rect.max = ImVec2(center.x + width * 0.5f, center.y + height * 0.5f);
+    }
+
+    Layout makeLayout(const ImVec2& display) const {
         const float unit = std::max(std::min(display.x, display.y), 1.0f);
         const float bottom_margin = unit * 0.075f;
         const float stick_radius = unit * 0.135f;
@@ -3658,6 +4137,28 @@ class ImGuiMobileControls {
             0,
             ICON_FA_PAUSE,
         };
+
+        const ControlTransform& stick_transform = transforms_[static_cast<size_t>(ControlElement::Stick)];
+        if (stick_transform.x >= 0.0f) layout.stick_center.x = stick_transform.x * display.x;
+        if (stick_transform.y >= 0.0f) layout.stick_center.y = stick_transform.y * display.y;
+        layout.stick_radius *= stick_transform.scale;
+        layout.stick_deadzone = layout.stick_radius * 0.27f;
+
+        for (size_t i = 0; i < layout.face.size(); ++i) {
+            const ControlTransform& transform = transforms_[static_cast<size_t>(ControlElement::Triangle) + i];
+            if (transform.x >= 0.0f) layout.face[i].center.x = transform.x * display.x;
+            if (transform.y >= 0.0f) layout.face[i].center.y = transform.y * display.y;
+            layout.face[i].radius *= transform.scale;
+        }
+
+        for (size_t i = 0; i < layout.utility.size(); ++i) {
+            applyRectTransform(
+                layout.utility[i],
+                transforms_[static_cast<size_t>(ControlElement::L2) + i],
+                display
+            );
+        }
+        applyRectTransform(layout.pause, transforms_[static_cast<size_t>(ControlElement::Pause)], display);
         return layout;
     }
 
@@ -3681,6 +4182,338 @@ class ImGuiMobileControls {
         if (dy <= -layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_UP;
         if (dy >= layout.stick_deadzone) mask |= PSXI_SW_SDA_PAD_DOWN;
         return mask;
+    }
+
+    static const char* elementToken(size_t index) {
+        static constexpr const char* kTokens[] = {
+            "dpad", "triangle", "circle", "cross", "square",
+            "l2", "l1", "r2", "r1", "select", "start", "pause"
+        };
+        return index < std::size(kTokens) ? kTokens[index] : "unknown";
+    }
+
+    static const char* elementTitle(size_t index) {
+        static constexpr const char* kTitles[] = {
+            "方向键", "△", "○", "×", "□",
+            "L2", "L1", "R2", "R1", "SELECT", "START", "暂停"
+        };
+        return index < std::size(kTitles) ? kTitles[index] : "未选择";
+    }
+
+    static int elementIndexForToken(std::string_view token) {
+        for (size_t i = 0; i < static_cast<size_t>(ControlElement::Count); ++i) {
+            if (token == elementToken(i)) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    bool saveLayout(const std::filesystem::path& path) const {
+        if (path.empty()) {
+            return false;
+        }
+        std::error_code ec;
+        if (path.has_parent_path()) {
+            std::filesystem::create_directories(path.parent_path(), ec);
+            if (ec) {
+                return false;
+            }
+        }
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        out << "ARMSX_TOUCH_LAYOUT 1\n";
+        for (size_t i = 0; i < transforms_.size(); ++i) {
+            const ControlTransform& transform = transforms_[i];
+            out << elementToken(i) << ' '
+                << transform.x << ' ' << transform.y << ' ' << transform.scale << '\n';
+        }
+        return static_cast<bool>(out);
+    }
+
+    bool loadLayout(const std::filesystem::path& path) {
+        if (path.empty()) {
+            return false;
+        }
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+        std::string magic;
+        int version = 0;
+        if (!(in >> magic >> version) || magic != "ARMSX_TOUCH_LAYOUT" || version != 1) {
+            return false;
+        }
+
+        std::array<ControlTransform, static_cast<size_t>(ControlElement::Count)> loaded{};
+        std::string token;
+        float x = -1.0f;
+        float y = -1.0f;
+        float scale = 1.0f;
+        size_t applied = 0;
+        while (in >> token >> x >> y >> scale) {
+            const int index = elementIndexForToken(token);
+            if (index < 0) {
+                continue;
+            }
+            ControlTransform& transform = loaded[static_cast<size_t>(index)];
+            transform.x = (x < 0.0f) ? -1.0f : std::clamp(x, 0.0f, 1.0f);
+            transform.y = (y < 0.0f) ? -1.0f : std::clamp(y, 0.0f, 1.0f);
+            transform.scale = std::clamp(scale, 0.45f, 2.5f);
+            applied++;
+        }
+        if (applied == 0) {
+            return false;
+        }
+        transforms_ = loaded;
+        return true;
+    }
+
+    static float distance(const ImVec2& a, const ImVec2& b) {
+        return std::sqrt(distanceSquared(a, b));
+    }
+
+    static RectButton editorDoneRect(const ImVec2& display) {
+        const float unit = std::max(std::min(display.x, display.y), 1.0f);
+        const float width = unit * 0.22f;
+        const float height = unit * 0.085f;
+        const float gap = unit * 0.03f;
+        const float y = display.y * 0.24f;
+        return RectButton{ImVec2(display.x * 0.5f - gap * 0.5f - width, y),
+            ImVec2(display.x * 0.5f - gap * 0.5f, y + height), 0, "完成"};
+    }
+
+    static RectButton editorResetRect(const ImVec2& display) {
+        const float unit = std::max(std::min(display.x, display.y), 1.0f);
+        const float width = unit * 0.22f;
+        const float height = unit * 0.085f;
+        const float gap = unit * 0.03f;
+        const float y = display.y * 0.24f;
+        return RectButton{ImVec2(display.x * 0.5f + gap * 0.5f, y),
+            ImVec2(display.x * 0.5f + gap * 0.5f + width, y + height), 0, "恢复默认"};
+    }
+
+    static ImVec2 elementCenter(const Layout& layout, size_t index) {
+        if (index == static_cast<size_t>(ControlElement::Stick)) {
+            return layout.stick_center;
+        }
+        const size_t face_begin = static_cast<size_t>(ControlElement::Triangle);
+        const size_t utility_begin = static_cast<size_t>(ControlElement::L2);
+        if (index >= face_begin && index < face_begin + layout.face.size()) {
+            return layout.face[index - face_begin].center;
+        }
+        if (index >= utility_begin && index < utility_begin + layout.utility.size()) {
+            return rectCenter(layout.utility[index - utility_begin]);
+        }
+        if (index == static_cast<size_t>(ControlElement::Pause)) {
+            return rectCenter(layout.pause);
+        }
+        return ImVec2();
+    }
+
+    static int elementAtPoint(const Layout& layout, const ImVec2& point) {
+        if (pointInRect(point, layout.pause)) {
+            return static_cast<int>(ControlElement::Pause);
+        }
+        for (size_t i = 0; i < layout.utility.size(); ++i) {
+            if (pointInRect(point, layout.utility[i])) {
+                return static_cast<int>(static_cast<size_t>(ControlElement::L2) + i);
+            }
+        }
+        for (size_t i = 0; i < layout.face.size(); ++i) {
+            const float hit = layout.face[i].radius * 1.35f;
+            if (distanceSquared(point, layout.face[i].center) <= hit * hit) {
+                return static_cast<int>(static_cast<size_t>(ControlElement::Triangle) + i);
+            }
+        }
+        const float stick_hit = layout.stick_radius * 1.35f;
+        if (distanceSquared(point, layout.stick_center) <= stick_hit * stick_hit) {
+            return static_cast<int>(ControlElement::Stick);
+        }
+        return -1;
+    }
+
+    void materializeSelectedPosition(const Layout& layout) {
+        if (selected_element_ < 0) {
+            return;
+        }
+        const ImVec2 center = elementCenter(layout, static_cast<size_t>(selected_element_));
+        ControlTransform& transform = transforms_[static_cast<size_t>(selected_element_)];
+        if (transform.x < 0.0f) transform.x = center.x / std::max(layout.display.x, 1.0f);
+        if (transform.y < 0.0f) transform.y = center.y / std::max(layout.display.y, 1.0f);
+    }
+
+    void moveSelectedTo(const ImVec2& point, const ImVec2& display) {
+        if (selected_element_ < 0) {
+            return;
+        }
+        ControlTransform& transform = transforms_[static_cast<size_t>(selected_element_)];
+        transform.x = std::clamp(point.x / std::max(display.x, 1.0f), 0.02f, 0.98f);
+        transform.y = std::clamp(point.y / std::max(display.y, 1.0f), 0.02f, 0.98f);
+    }
+
+    void finishLayoutEditor() {
+        if (!persistent_layout_path_.empty()) {
+            saveLayout(persistent_layout_path_);
+        }
+        editing_ = false;
+        editor_finished_ = true;
+        editor_touches_.clear();
+        mouse_dragging_ = false;
+        pinch_start_distance_ = 0.0f;
+    }
+
+    void selectEditorElement(const ImVec2& point, const ImVec2& display) {
+        const Layout layout = makeLayout(display);
+        selected_element_ = elementAtPoint(layout, point);
+        if (selected_element_ >= 0) {
+            materializeSelectedPosition(layout);
+        }
+    }
+
+    void processEditorEvent(const SDL_Event& event) {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        if (display.x <= 0.0f || display.y <= 0.0f) {
+            return;
+        }
+
+        auto handle_action = [&](const ImVec2& point) -> bool {
+            if (pointInRect(point, editorDoneRect(display))) {
+                finishLayoutEditor();
+                return true;
+            }
+            if (pointInRect(point, editorResetRect(display))) {
+                resetLayoutToDefaults();
+                selected_element_ = -1;
+                return true;
+            }
+            return false;
+        };
+
+        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+            const ImVec2 point(static_cast<float>(event.button.x), static_cast<float>(event.button.y));
+            if (handle_action(point)) return;
+            selectEditorElement(point, display);
+            mouse_dragging_ = selected_element_ >= 0;
+            return;
+        }
+        if (event.type == SDL_MOUSEMOTION && mouse_dragging_ && selected_element_ >= 0 &&
+            (event.motion.state & SDL_BUTTON_LMASK)) {
+            moveSelectedTo(ImVec2(static_cast<float>(event.motion.x), static_cast<float>(event.motion.y)), display);
+            return;
+        }
+        if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+            mouse_dragging_ = false;
+            if (!persistent_layout_path_.empty()) saveLayout(persistent_layout_path_);
+            return;
+        }
+        if (event.type != SDL_FINGERDOWN && event.type != SDL_FINGERMOTION && event.type != SDL_FINGERUP) {
+            return;
+        }
+
+        const ImVec2 point(
+            std::clamp(event.tfinger.x, 0.0f, 1.0f) * display.x,
+            std::clamp(event.tfinger.y, 0.0f, 1.0f) * display.y
+        );
+        auto found = std::find_if(editor_touches_.begin(), editor_touches_.end(), [&](const EditorTouch& touch) {
+            return touch.id == event.tfinger.fingerId;
+        });
+
+        if (event.type == SDL_FINGERDOWN) {
+            if (editor_touches_.empty() && handle_action(point)) return;
+            editor_touches_.push_back(EditorTouch{event.tfinger.fingerId, point});
+            if (editor_touches_.size() == 1) {
+                selectEditorElement(point, display);
+            }
+            if (editor_touches_.size() >= 2 && selected_element_ >= 0) {
+                pinch_start_distance_ = distance(editor_touches_[0].point, editor_touches_[1].point);
+                pinch_start_scale_ = transforms_[static_cast<size_t>(selected_element_)].scale;
+            }
+            return;
+        }
+
+        if (event.type == SDL_FINGERUP) {
+            if (found != editor_touches_.end()) editor_touches_.erase(found);
+            pinch_start_distance_ = 0.0f;
+            if (editor_touches_.size() >= 2 && selected_element_ >= 0) {
+                pinch_start_distance_ = distance(editor_touches_[0].point, editor_touches_[1].point);
+                pinch_start_scale_ = transforms_[static_cast<size_t>(selected_element_)].scale;
+            }
+            if (editor_touches_.empty() && !persistent_layout_path_.empty()) saveLayout(persistent_layout_path_);
+            return;
+        }
+
+        if (found != editor_touches_.end()) {
+            found->point = point;
+        }
+        if (selected_element_ < 0) {
+            return;
+        }
+        if (editor_touches_.size() >= 2) {
+            const float current_distance = distance(editor_touches_[0].point, editor_touches_[1].point);
+            if (pinch_start_distance_ > 4.0f) {
+                transforms_[static_cast<size_t>(selected_element_)].scale = std::clamp(
+                    pinch_start_scale_ * current_distance / pinch_start_distance_,
+                    0.45f,
+                    2.5f
+                );
+            }
+        } else if (editor_touches_.size() == 1) {
+            moveSelectedTo(editor_touches_[0].point, display);
+        }
+    }
+
+    void drawEditor(const Layout& layout) {
+        draw(layout, 0);
+        ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+        const ImU32 selected_color = IM_COL32(255, 210, 70, 255);
+        if (selected_element_ >= 0) {
+            const size_t index = static_cast<size_t>(selected_element_);
+            if (index == static_cast<size_t>(ControlElement::Stick)) {
+                draw_list->AddCircle(layout.stick_center, layout.stick_radius * 1.12f, selected_color, 48, 4.0f);
+            } else if (index >= static_cast<size_t>(ControlElement::Triangle) &&
+                       index <= static_cast<size_t>(ControlElement::Square)) {
+                const Button& button = layout.face[index - static_cast<size_t>(ControlElement::Triangle)];
+                draw_list->AddCircle(button.center, button.radius * 1.18f, selected_color, 40, 4.0f);
+            } else {
+                RectButton rect = index == static_cast<size_t>(ControlElement::Pause)
+                    ? layout.pause
+                    : layout.utility[index - static_cast<size_t>(ControlElement::L2)];
+                draw_list->AddRect(
+                    ImVec2(rect.min.x - 5.0f, rect.min.y - 5.0f),
+                    ImVec2(rect.max.x + 5.0f, rect.max.y + 5.0f),
+                    selected_color,
+                    12.0f,
+                    0,
+                    4.0f
+                );
+            }
+        }
+
+        auto draw_action = [&](const RectButton& button) {
+            draw_list->AddRectFilled(button.min, button.max, IM_COL32(15, 18, 25, 225), 10.0f);
+            draw_list->AddRect(button.min, button.max, IM_COL32(245, 247, 252, 235), 10.0f, 0, 2.0f);
+            drawCenteredText(draw_list, rectCenter(button), IM_COL32(255, 255, 255, 255), button.label);
+        };
+        draw_action(editorDoneRect(layout.display));
+        draw_action(editorResetRect(layout.display));
+
+        const char* selected = selected_element_ >= 0 ? elementTitle(static_cast<size_t>(selected_element_)) : "未选择";
+        const std::string line = std::string("布局编辑：拖动元素改变位置。选中后双指捏合调整大小。 当前：") + selected;
+        const ImVec2 text_size = ImGui::CalcTextSize(line.c_str());
+        draw_list->AddRectFilled(
+            ImVec2(layout.display.x * 0.5f - text_size.x * 0.5f - 14.0f, layout.display.y * 0.16f),
+            ImVec2(layout.display.x * 0.5f + text_size.x * 0.5f + 14.0f, layout.display.y * 0.16f + text_size.y + 12.0f),
+            IM_COL32(0, 0, 0, 185),
+            8.0f
+        );
+        draw_list->AddText(
+            ImVec2(layout.display.x * 0.5f - text_size.x * 0.5f, layout.display.y * 0.16f + 6.0f),
+            IM_COL32(255, 255, 255, 255),
+            line.c_str()
+        );
     }
 
     static void captureTouch(Touch& touch, const Layout& layout, const ImVec2& point) {
@@ -3789,7 +4622,7 @@ class ImGuiMobileControls {
         }
     }
 
-    static void draw(const Layout& layout, uint32_t active_mask) {
+    void draw(const Layout& layout, uint32_t active_mask) {
         ImDrawList* draw_list = ImGui::GetForegroundDrawList();
         const ImU32 panel = IM_COL32(18, 20, 28, 112);
         const ImU32 outline = IM_COL32(235, 238, 246, 185);
@@ -3799,8 +4632,10 @@ class ImGuiMobileControls {
         draw_list->AddCircle(layout.stick_center, layout.stick_radius, outline, 40, 2.5f);
         ImVec2 knob = layout.stick_center;
         const float knob_offset = layout.stick_radius * 0.43f;
+        const bool digital_horizontal = (active_mask & (PSXI_SW_SDA_PAD_LEFT | PSXI_SW_SDA_PAD_RIGHT)) != 0;
         if (active_mask & PSXI_SW_SDA_PAD_LEFT) knob.x -= knob_offset;
         if (active_mask & PSXI_SW_SDA_PAD_RIGHT) knob.x += knob_offset;
+        if (!digital_horizontal) knob.x += knob_offset * gravity_visual_x_;
         if (active_mask & PSXI_SW_SDA_PAD_UP) knob.y -= knob_offset;
         if (active_mask & PSXI_SW_SDA_PAD_DOWN) knob.y += knob_offset;
         const bool stick_active = (active_mask &
@@ -3841,12 +4676,24 @@ class ImGuiMobileControls {
 
     std::vector<Touch> touches_;
     std::vector<SDL_FingerID> suppressed_touches_;
+    std::array<ControlTransform, static_cast<size_t>(ControlElement::Count)> transforms_{};
+    std::vector<EditorTouch> editor_touches_;
+    std::filesystem::path persistent_layout_path_;
+    std::filesystem::path exchange_layout_path_;
     uint32_t routed_mask_ = 0;
     Uint32 last_activity_ms_ = 0;
+    int selected_element_ = -1;
+    float pinch_start_distance_ = 0.0f;
+    float pinch_start_scale_ = 1.0f;
     bool visible_ = true;
     bool controller_in_use_ = false;
     bool suppress_mouse_until_up_ = false;
     bool pause_requested_ = false;
+    bool editing_ = false;
+    bool editor_finished_ = false;
+    bool mouse_dragging_ = false;
+    bool stick_touch_active_ = false;
+    float gravity_visual_x_ = 0.0f;
 };
 
 class ArmsxApp {
@@ -3856,11 +4703,6 @@ class ArmsxApp {
           external_renderer_(static_cast<SDL_Renderer*>(external_renderer)), cli_(ScanCliFlags(argc, argv)) {}
 
     int run() {
-#if defined(IOS_TARGET)
-        psxe_diag_set_enabled(1);
-        log_set_level(LOG_INFO);
-        log_set_quiet(0);
-#endif
         psxe_diag_initialize(psxe_cfg_get_pref_path());
         psxe_diag_breadcrumbf("ARMSX startup argc=%d", argc_);
         psxe_diag_logf("diag", "Pref path: %s", psxe_cfg_get_pref_path() ? psxe_cfg_get_pref_path() : "(none)");
@@ -3882,6 +4724,12 @@ class ArmsxApp {
         psxe_cfg_load(cfg, argc_, const_cast<const char**>(argv_));
         settings_ = BuildSettings(cfg, cli_);
         psxe_cfg_destroy(cfg);
+#if defined(IOS_TARGET)
+        settings_.logging_enabled = IosDebugLoggingRequested();
+        settings_.quiet = !settings_.logging_enabled;
+#endif
+        mobile_controls_.configureLayoutFiles(DefaultTouchLayoutPath(), SharedTouchLayoutPath());
+        NotifyPlatformGravityMotionEnabled(false);
         syncPlatformLibraries(false, false);
 
         applyLoggingSettings("startup");
@@ -4448,12 +5296,7 @@ class ArmsxApp {
     }
 
     void applyLoggingSettings(const char* reason) {
-#if defined(IOS_TARGET)
-        settings_.logging_enabled = true;
-        const bool enable_logs = true;
-#else
         const bool enable_logs = settings_.logging_enabled;
-#endif
         settings_.quiet = !enable_logs;
 
         if (!enable_logs && psxe_diag_is_enabled()) {
@@ -4856,6 +5699,7 @@ class ArmsxApp {
 
     void shutdown() {
         psxe_diag_breadcrumbf("Frontend shutdown");
+        NotifyPlatformGravityMotionEnabled(false);
         input_router_.detach();
         session_.destroy();
 
@@ -4879,8 +5723,18 @@ class ArmsxApp {
     }
 
     void handleEvent(const SDL_Event& event) {
+        if (mobile_controls_.editing()) {
+            mobile_controls_.processEvent(event);
+            if (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERMOTION || event.type == SDL_FINGERUP ||
+                event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEMOTION) {
+                return;
+            }
+        }
+
         imgui_backend_.processEvent(event);
-        mobile_controls_.processEvent(event);
+        if (!mobile_controls_.editing()) {
+            mobile_controls_.processEvent(event);
+        }
 
         if (event.type == SDL_QUIT) {
             running_ = false;
@@ -4937,6 +5791,8 @@ class ArmsxApp {
 
         consumePendingLaunchArguments();
 
+        updateGravityLeftStick();
+
         waitForFrameDeadline(currentTargetFrameRate());
 
         std::uint32_t session_steps = 0;
@@ -4975,10 +5831,20 @@ class ArmsxApp {
             session_.draw(settings_);
         }
 
-        if (session_.valid() && settings_.mobile_controls && !fsui::HasActiveWindow()) {
+        if (mobile_controls_.editing()) {
+            mobile_controls_.drawAndRoute(input_router_);
+        } else if (session_.valid() && settings_.mobile_controls && !fsui::HasActiveWindow()) {
             mobile_controls_.drawAndRoute(input_router_);
         } else {
             mobile_controls_.reset(input_router_);
+        }
+
+        if (mobile_controls_.takeEditorFinished()) {
+            if (session_.valid()) {
+                session_.setPaused(true);
+            }
+            input_router_.onFsuiOpened();
+            switchToSettingsWindow();
         }
 
         if (pending_error_dialog_.has_value()) {
@@ -5134,6 +6000,15 @@ class ArmsxApp {
     }
 
     bool launchSession(const LaunchRequest& request, bool close_ui) {
+        bool preserve_gravity_override = false;
+        if (session_.valid()) {
+            const LaunchRequest current = session_.currentLaunchRequest();
+            preserve_gravity_override = current.kind == request.kind && current.path == request.path;
+        }
+        if (!preserve_gravity_override) {
+            gravity_left_stick_session_override_.reset();
+        }
+
         std::string error;
         psxe_diag_breadcrumbf("Launching session kind=%s path=%s close_ui=%s",
             LaunchKindTitle(request.kind),
@@ -5141,6 +6016,7 @@ class ArmsxApp {
             close_ui ? "true" : "false");
 
         if (!session_.create(renderer_, settings_, request, error)) {
+            NotifyPlatformGravityMotionEnabled(false);
             pending_error_dialog_ = error;
             psxe_diag_logf("launch", "Session launch failed kind=%s error=%s", LaunchKindTitle(request.kind), error.c_str());
             if (request.kind == LaunchKind::Bios) {
@@ -5152,6 +6028,7 @@ class ArmsxApp {
         }
 
         input_router_.attach(session_.pad());
+        NotifyPlatformGravityMotionEnabled(effectiveGravityLeftStickEnabled());
         mobile_controls_.showNow();
         resetFramePacing("launch-session");
         applyWindowMetrics();
@@ -5201,6 +6078,9 @@ class ArmsxApp {
 
     void exitToLibrary() {
         psxe_diag_breadcrumbf("Exit to library requested");
+        gravity_left_stick_session_override_.reset();
+        gravity_left_stick_filtered_x_ = 0.0f;
+        NotifyPlatformGravityMotionEnabled(false);
         input_router_.detach();
         session_.destroy();
         resetFramePacing("exit-to-library");
@@ -5593,6 +6473,48 @@ class ArmsxApp {
         reset.command = fsui::MakeResetCommand();
         items.push_back(std::move(reset));
 
+        const std::filesystem::path state_path = quickStatePath();
+
+        fsui::MenuItemDescriptor save_state;
+        save_state.id = "quick-save-state";
+        save_state.title = ICON_FA_SAVE " 即时保存";
+        save_state.summary = "保存当前 PSX 运行状态到此游戏的单一即时存档。再次保存会覆盖。";
+        save_state.on_activate = [this, state_path]() {
+            std::error_code ec;
+            std::filesystem::create_directories(state_path.parent_path(), ec);
+            if (ec || !session_.saveState(state_path)) {
+                pending_error_dialog_ = "即时保存失败。";
+                return;
+            }
+            psxe_diag_logf("state", "Quick save completed path=%s", state_path.string().c_str());
+        };
+        items.push_back(std::move(save_state));
+
+        fsui::MenuItemDescriptor load_state;
+        load_state.id = "quick-load-state";
+        load_state.title = ICON_FA_UNDO " 即时读取";
+        load_state.summary = "读取此游戏最近一次即时保存的状态并继续游戏。";
+        {
+            std::error_code ec;
+            load_state.enabled = std::filesystem::is_regular_file(state_path, ec);
+        }
+        if (!load_state.enabled) {
+            load_state.unavailable_title = "没有即时存档";
+            load_state.unavailable_message = "请先使用“即时保存”。";
+        }
+        load_state.on_activate = [this, state_path]() {
+            if (!session_.loadState(state_path)) {
+                pending_error_dialog_ = "即时读取失败，存档可能来自不兼容的 ARMSX 版本。";
+                return;
+            }
+            input_router_.attach(session_.pad());
+            mobile_controls_.showNow();
+            session_.setPaused(false);
+            resetFramePacing("quick-load-state");
+            returnToMainWindow();
+        };
+        items.push_back(std::move(load_state));
+
         fsui::MenuItemDescriptor change_disc;
         change_disc.id = "change-disc";
         change_disc.title = ICON_FA_COMPACT_DISC " 更换光盘";
@@ -5625,6 +6547,19 @@ class ArmsxApp {
         settings.summary = "打开游戏内设置。";
         settings.on_activate = [this]() { switchToSettingsWindow(); };
         items.push_back(std::move(settings));
+
+#if defined(IOS_TARGET)
+        fsui::MenuItemDescriptor gravity_left_stick;
+        gravity_left_stick.id = "gravity-left-stick-temporary";
+        const bool gravity_enabled = effectiveGravityLeftStickEnabled();
+        gravity_left_stick.title = std::string(gravity_enabled ? ICON_FA_TOGGLE_ON : ICON_FA_TOGGLE_OFF) +
+            (gravity_enabled ? " 重力感应摇杆  已开启" : " 重力感应摇杆  已关闭");
+        gravity_left_stick.summary = "仅对当前游戏临时生效，不修改全局设置。";
+        gravity_left_stick.on_activate = [this]() {
+            setTemporaryGravityLeftStickEnabled(!effectiveGravityLeftStickEnabled());
+        };
+        items.push_back(std::move(gravity_left_stick));
+#endif
 
         fsui::MenuItemDescriptor fast_forward;
         fast_forward.id = "fast-forward";
@@ -5775,7 +6710,7 @@ class ArmsxApp {
             cpu_engine.kind = fsui::SettingsRowKind::Choice;
             cpu_engine.id = "cpu-engine";
             cpu_engine.title = ICON_FA_MICROCHIP " CPU 引擎";
-            cpu_engine.summary = "正常游玩建议使用缓存解释器；兼容性排查可使用参考解释器。下次启动游戏时生效。";
+            cpu_engine.summary = "正常游玩建议使用缓存解释器。兼容性排查可使用参考解释器。下次启动游戏时生效。";
             cpu_engine.value = CpuEngineTitle(settings_.cpu_engine);
             cpu_engine.dialog_title = cpu_engine.title;
             cpu_engine.choices = BuildCpuEngineChoices(settings_.cpu_engine);
@@ -5879,7 +6814,7 @@ class ArmsxApp {
             browse_notice.kind = fsui::SettingsRowKind::Notice;
             browse_notice.id = "uwp-filesystem-roots";
             browse_notice.title = ICON_FA_FOLDER_OPEN " 已挂载位置";
-            browse_notice.summary = "文件选择器中可访问各存储根目录；使用“文件系统根目录”或“上级目录”切换位置。";
+            browse_notice.summary = "文件选择器中可访问各存储根目录。使用“文件系统根目录”或“上级目录”切换位置。";
             rows.push_back(std::move(browse_notice));
 #endif
 
@@ -5993,28 +6928,39 @@ class ArmsxApp {
         advanced_page.build_rows = [this]() {
             std::vector<fsui::SettingsRowDescriptor> rows;
 
-#if defined(IOS_TARGET)
-            fsui::SettingsRowDescriptor logging_status;
-            logging_status.kind = fsui::SettingsRowKind::Notice;
-            logging_status.id = "logging-status";
-            logging_status.title = ICON_FA_BUG " 模拟器日志";
-            logging_status.summary = "启动、PSX 核心、SDL 和游戏控制台输出始终写入日志文件。";
-            logging_status.value = "已开启";
-            rows.push_back(std::move(logging_status));
-#else
             fsui::SettingsRowDescriptor logging_enabled;
             logging_enabled.kind = fsui::SettingsRowKind::Toggle;
             logging_enabled.id = "logging-enabled";
             logging_enabled.title = ICON_FA_BUG " 调试日志";
+#if defined(IOS_TARGET)
+            logging_enabled.summary =
+                "控制 Documents/armsx_log.txt。核心调试日志立即生效。完整 stdout/stderr 捕获在下次启动时按此开关启用或关闭。正常游玩建议关闭。";
+#else
             logging_enabled.summary =
                 "写入用于故障排查的诊断日志。正常游玩时建议关闭，以免影响性能。";
+#endif
             logging_enabled.toggle_value = settings_.logging_enabled;
             logging_enabled.on_toggle = [this](bool value) {
                 settings_.logging_enabled = value;
+#if defined(IOS_TARGET)
+                if (!SetIosDebugLoggingRequested(value)) {
+                    pending_error_dialog_ = value ? "无法启用 iOS 调试日志标记。" : "无法关闭 iOS 调试日志标记。";
+                }
+#endif
                 applyLoggingSettings("settings-toggle");
                 SaveSettings(settings_);
             };
             rows.push_back(std::move(logging_enabled));
+
+#if defined(IOS_TARGET)
+            static const JitRuntimeStatus jit_status = QueryJitRuntimeStatus();
+            fsui::SettingsRowDescriptor jit;
+            jit.kind = fsui::SettingsRowKind::Value;
+            jit.id = "jit-runtime-status";
+            jit.title = ICON_FA_MICROCHIP " JIT 状态";
+            jit.summary = jit_status.detail;
+            jit.value = jit_status.value;
+            rows.push_back(std::move(jit));
 #endif
 
             fsui::SettingsRowDescriptor mobile_controls;
@@ -6035,6 +6981,119 @@ class ArmsxApp {
             };
             rows.push_back(std::move(mobile_controls));
 
+#if defined(IOS_TARGET)
+            fsui::SettingsRowDescriptor gravity_left_stick;
+            gravity_left_stick.kind = fsui::SettingsRowKind::Toggle;
+            gravity_left_stick.id = "gravity-left-stick";
+            gravity_left_stick.title = ICON_FA_COMPASS " 重力感应摇杆";
+            gravity_left_stick.summary = "倾斜设备控制左摇杆横向转向。触摸左侧摇杆时触摸输入优先。适合赛车游戏。";
+            gravity_left_stick.toggle_value = settings_.gravity_left_stick_enabled;
+            gravity_left_stick.on_toggle = [this](bool value) {
+                settings_.gravity_left_stick_enabled = value;
+                gravity_left_stick_session_override_.reset();
+                gravity_left_stick_filtered_x_ = 0.0f;
+                input_router_.setGravityLeftStick(0.0f, false);
+                mobile_controls_.setGravityVisualX(0.0f);
+                NotifyPlatformGravityMotionEnabled(value && session_.valid());
+                SaveSettings(settings_);
+            };
+            rows.push_back(std::move(gravity_left_stick));
+
+            if (settings_.gravity_left_stick_enabled) {
+                fsui::SettingsRowDescriptor gravity_deadzone;
+                gravity_deadzone.kind = fsui::SettingsRowKind::Choice;
+                gravity_deadzone.id = "gravity-left-stick-deadzone";
+                gravity_deadzone.title = ICON_FA_BULLSEYE " 重力摇杆死区";
+                gravity_deadzone.summary = "忽略设备轻微倾斜和传感器抖动。数值越大，中间不响应的范围越宽。";
+                gravity_deadzone.value = GravityDeadzoneTitle(settings_.gravity_left_stick_deadzone);
+                gravity_deadzone.dialog_title = gravity_deadzone.title;
+                gravity_deadzone.choices = BuildGravityDeadzoneChoices(settings_.gravity_left_stick_deadzone);
+                gravity_deadzone.on_choice = [this](int index) {
+                    const std::vector<float> values = GravityDeadzoneValues();
+                    if (index >= 0 && index < static_cast<int>(values.size())) {
+                        settings_.gravity_left_stick_deadzone = values[static_cast<size_t>(index)];
+                        gravity_left_stick_filtered_x_ = 0.0f;
+                        SaveSettings(settings_);
+                    }
+                };
+                rows.push_back(std::move(gravity_deadzone));
+
+                fsui::SettingsRowDescriptor gravity_sensitivity;
+                gravity_sensitivity.kind = fsui::SettingsRowKind::Choice;
+                gravity_sensitivity.id = "gravity-left-stick-sensitivity";
+                gravity_sensitivity.title = ICON_FA_TACHOMETER_ALT " 重力摇杆灵敏度";
+                gravity_sensitivity.summary = "控制相同倾斜角度对应的转向幅度。1.00x 为默认值。";
+                gravity_sensitivity.value = GravitySensitivityTitle(settings_.gravity_left_stick_sensitivity);
+                gravity_sensitivity.dialog_title = gravity_sensitivity.title;
+                gravity_sensitivity.choices = BuildGravitySensitivityChoices(settings_.gravity_left_stick_sensitivity);
+                gravity_sensitivity.on_choice = [this](int index) {
+                    const std::vector<float> values = GravitySensitivityValues();
+                    if (index >= 0 && index < static_cast<int>(values.size())) {
+                        settings_.gravity_left_stick_sensitivity = values[static_cast<size_t>(index)];
+                        gravity_left_stick_filtered_x_ = 0.0f;
+                        SaveSettings(settings_);
+                    }
+                };
+                rows.push_back(std::move(gravity_sensitivity));
+            }
+#endif
+
+            fsui::SettingsRowDescriptor edit_controls;
+            edit_controls.kind = fsui::SettingsRowKind::Action;
+            edit_controls.id = "edit-touch-layout";
+            edit_controls.title = ICON_FA_ARROWS_ALT " 编辑触控布局";
+            edit_controls.summary = "进入全屏布局编辑：拖动每个元素改变位置。先选中元素，再用双指捏合调整该元素大小。";
+            edit_controls.enabled = settings_.mobile_controls;
+            edit_controls.on_activate = [this]() {
+                fsui::ReturnToMainWindow();
+                ui_window_state_ = FsuiWindowState::None;
+                input_router_.onFsuiClosed();
+                if (session_.valid()) {
+                    session_.setPaused(true);
+                }
+                mobile_controls_.beginLayoutEditor();
+            };
+            rows.push_back(std::move(edit_controls));
+
+            fsui::SettingsRowDescriptor reset_controls;
+            reset_controls.kind = fsui::SettingsRowKind::Action;
+            reset_controls.id = "reset-touch-layout";
+            reset_controls.title = ICON_FA_SYNC " 恢复默认触控布局";
+            reset_controls.summary = "清除自定义位置和大小，恢复随屏幕尺寸自适应的默认布局。";
+            reset_controls.on_activate = [this]() {
+                if (!mobile_controls_.resetLayoutToDefaults()) {
+                    pending_error_dialog_ = "无法保存默认触控布局。";
+                }
+                mobile_controls_.showNow();
+            };
+            rows.push_back(std::move(reset_controls));
+
+            fsui::SettingsRowDescriptor export_controls;
+            export_controls.kind = fsui::SettingsRowKind::Action;
+            export_controls.id = "export-touch-layout";
+            export_controls.title = ICON_FA_FILE_EXPORT " 导出触控布局";
+            export_controls.summary = std::string("导出到：") + mobile_controls_.exchangeLayoutPath().string();
+            export_controls.on_activate = [this]() {
+                if (!mobile_controls_.exportLayout()) {
+                    pending_error_dialog_ = "触控布局导出失败。";
+                }
+            };
+            rows.push_back(std::move(export_controls));
+
+            fsui::SettingsRowDescriptor import_controls;
+            import_controls.kind = fsui::SettingsRowKind::Action;
+            import_controls.id = "import-touch-layout";
+            import_controls.title = ICON_FA_FILE_IMPORT " 导入触控布局";
+            import_controls.summary = std::string("从同一文件读取：") + mobile_controls_.exchangeLayoutPath().string();
+            import_controls.on_activate = [this]() {
+                if (!mobile_controls_.importLayout()) {
+                    pending_error_dialog_ = "触控布局导入失败。请先把有效的 ARMSX-TouchLayout.layout 放到 Documents。";
+                    return;
+                }
+                mobile_controls_.showNow();
+            };
+            rows.push_back(std::move(import_controls));
+
             if (settings_.logging_enabled) {
                 fsui::SettingsRowDescriptor log_level;
                 log_level.kind = fsui::SettingsRowKind::Choice;
@@ -6052,18 +7111,22 @@ class ArmsxApp {
                 rows.push_back(std::move(log_level));
 
                 fsui::SettingsRowDescriptor log_path;
-                log_path.kind = fsui::SettingsRowKind::Notice;
+                log_path.kind = fsui::SettingsRowKind::Value;
                 log_path.id = "log-path";
                 log_path.title = ICON_FA_FILE_ALT " 日志文件";
-                log_path.summary = diagnosticsLogPath().string();
+                const std::filesystem::path log_file = diagnosticsLogPath();
+                log_path.summary = log_file.string();
+                log_path.value = log_file.filename().string();
                 rows.push_back(std::move(log_path));
             }
 
             fsui::SettingsRowDescriptor settings_path;
-            settings_path.kind = fsui::SettingsRowKind::Notice;
+            settings_path.kind = fsui::SettingsRowKind::Value;
             settings_path.id = "settings-path";
             settings_path.title = ICON_FA_FILE_ALT " 设置文件";
-            settings_path.summary = settings_.settings_path;
+            const std::filesystem::path settings_file(settings_.settings_path);
+            settings_path.summary = settings_file.string();
+            settings_path.value = settings_file.filename().string();
             rows.push_back(std::move(settings_path));
 
             return rows;
@@ -6219,11 +7282,11 @@ class ArmsxApp {
         vsync.id = "vsync";
         vsync.title = ICON_FA_SYNC " VSync";
 #if defined(__EMSCRIPTEN__)
-        vsync.summary = "将画面显示与屏幕刷新率同步；网页版由浏览器控制。";
+        vsync.summary = "将画面显示与屏幕刷新率同步。网页版由浏览器控制。";
 #else
         vsync.summary = can_control_vsync
             ? "将画面显示与屏幕刷新率同步，以减少撕裂。立即生效。"
-            : "将画面显示与屏幕刷新率同步；当前渲染器由宿主程序控制。";
+            : "将画面显示与屏幕刷新率同步。当前渲染器由宿主程序控制。";
 #endif
         vsync.toggle_value = settings_.vsync_enabled;
         vsync.enabled = can_control_vsync;
@@ -6407,6 +7470,65 @@ class ArmsxApp {
         return DefaultBrowseDirectory();
     }
 
+    void updateGravityLeftStick() {
+        const bool enabled = effectiveGravityLeftStickEnabled() && session_.valid();
+        if (!enabled) {
+            gravity_left_stick_filtered_x_ = 0.0f;
+            input_router_.setGravityLeftStick(0.0f, false);
+            mobile_controls_.setGravityVisualX(0.0f);
+            return;
+        }
+
+        constexpr float kBaseFullScaleDelta = 0.35f;
+        constexpr float kSmoothingRetention = 0.28f;
+        const float deadzone = std::clamp(settings_.gravity_left_stick_deadzone, 0.0f, 0.25f);
+        const float sensitivity = std::clamp(settings_.gravity_left_stick_sensitivity, 0.25f, 2.0f);
+        const float raw = g_gravity_screen_x.load(std::memory_order_relaxed);
+        const float normalized_tilt = raw / (kBaseFullScaleDelta / sensitivity);
+        const float magnitude = std::abs(normalized_tilt);
+
+        float target = 0.0f;
+        if (magnitude > deadzone) {
+            const float usable_range = std::max(1.0f - deadzone, 0.001f);
+            const float normalized = std::min((magnitude - deadzone) / usable_range, 1.0f);
+            target = normalized_tilt < 0.0f ? -normalized : normalized;
+        }
+
+        gravity_left_stick_filtered_x_ +=
+            (target - gravity_left_stick_filtered_x_) * (1.0f - kSmoothingRetention);
+
+        const bool touch_priority = settings_.mobile_controls && mobile_controls_.stickTouchActive();
+        const float applied = touch_priority ? 0.0f : gravity_left_stick_filtered_x_;
+        input_router_.setGravityLeftStick(applied, true);
+        mobile_controls_.setGravityVisualX(applied);
+    }
+
+    bool effectiveGravityLeftStickEnabled() const {
+        return gravity_left_stick_session_override_.value_or(settings_.gravity_left_stick_enabled);
+    }
+
+    void setTemporaryGravityLeftStickEnabled(bool enabled) {
+        gravity_left_stick_session_override_ = enabled;
+        gravity_left_stick_filtered_x_ = 0.0f;
+        input_router_.setGravityLeftStick(0.0f, false);
+        mobile_controls_.setGravityVisualX(0.0f);
+        NotifyPlatformGravityMotionEnabled(enabled && session_.valid());
+        psxe_diag_logf(
+            "input",
+            "Temporary gravity left stick %s for current game",
+            enabled ? "enabled" : "disabled"
+        );
+    }
+
+    std::filesystem::path quickStatePath() const {
+        const fsui::CurrentGameInfo info = session_.currentGameInfo();
+        const std::string identity = info.path.empty() ? info.title : info.path.generic_string();
+        const std::string stem = SafeFileComponent(info.title.empty() ? "game" : info.title);
+        char hash[16] = {};
+        std::snprintf(hash, sizeof(hash), "%08x", Fnv1a32(identity));
+        return DefaultBrowseDirectory() / "Saves" / (stem + "-" + hash + ".state");
+    }
+
     std::filesystem::path browseDirectoryForPath(const std::string& configured_path, bool expect_directory) const {
         std::error_code ec;
 
@@ -6474,6 +7596,8 @@ class ArmsxApp {
     bool managed_renderer_vsync_ = DefaultVsyncEnabled();
     uint64_t next_frame_deadline_ = 0;
     uint64_t frame_period_ticks_ = 0;
+    float gravity_left_stick_filtered_x_ = 0.0f;
+    std::optional<bool> gravity_left_stick_session_override_{};
 };
 
 std::string ModuleNameFromPath(const char* path) {
@@ -6640,6 +7764,18 @@ extern "C" PSXE_API void psxe_set_library_directory_removed_callback(
 ) {
     g_platform_directory_removed_callback = callback;
     g_platform_directory_removed_userdata = userdata;
+}
+
+extern "C" PSXE_API void psxe_set_gravity_motion_enabled_callback(
+    GravityMotionEnabledCallback callback,
+    void* userdata
+) {
+    g_gravity_motion_enabled_callback = callback;
+    g_gravity_motion_enabled_userdata = userdata;
+}
+
+extern "C" PSXE_API void psxe_set_gravity_sample(float screen_x) {
+    g_gravity_screen_x.store(std::clamp(screen_x, -1.0f, 1.0f), std::memory_order_relaxed);
 }
 
 extern "C" PSXE_API void psxe_register_platform_library_directory(
