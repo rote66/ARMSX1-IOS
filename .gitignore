@@ -43,6 +43,10 @@ mobile/temp/*
 ios/HostApp/ARMSX.xcodeproj/
 ios/HostApp/ARMSX.xcworkspace/
 build/
+dist/
+log.log
+armsx_log.txt
+docs/history-session/
 .vs/
 obj/
 uwp/ARMSX/AppPackages/*
