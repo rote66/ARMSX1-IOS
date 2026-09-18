@@ -66,7 +66,7 @@ Documents/
 ios/
 ├── Frameworks/
 │   ├── SDL2.xcframework/
-│   └── libarmsx.dylib
+│   └── libarmsx.dylib       由 `./build.sh ios` 生成，不纳入 Git
 ├── HostApp/
 │   ├── Sources/
 │   │   ├── AppDelegate.mm

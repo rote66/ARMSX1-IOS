@@ -47,6 +47,7 @@ dist/
 log.log
 armsx_log.txt
 docs/history-session/
+ios/Frameworks/libarmsx.dylib
 .vs/
 obj/
 uwp/ARMSX/AppPackages/*
