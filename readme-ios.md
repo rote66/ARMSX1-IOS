@@ -1,6 +1,6 @@
 # ARMSX iOS 说明与编译指南
 
-本文档说明 ARMSX 当前 iOS 版本的运行方式、目录结构、已知限制和完整编译流程。文档中的命令全部使用仓库相对路径，不依赖任何个人目录。
+本文档说明 ARMSX 当前 iOS 版本的运行方式、目录结构、已知限制和完整编译流程。
 
 ## 目标平台
 
@@ -15,10 +15,9 @@
 
 - `com.apple.security.cs.allow-jit`
 - `com.apple.security.cs.allow-unsigned-executable-memory`
-- `dynamic-codesigning`
 - `get-task-allow`
 
-这些权限为后续 JIT/动态代码执行保留条件，但当前 ARMSX 的 CPU 执行引擎仍是解释器；权限本身不会把解释器变成动态重编译器。设置页中的“JIT 状态”是运行时可执行内存能力探测，不代表当前 CPU 核心已经启用了 JIT。
+`dynamic-codesigning` 不写入最终包；`ios/build-ipa.sh` 会把它视为 TrollStore 不兼容 entitlement 并直接拒绝打包。上述 JIT 权限为后续动态代码执行保留条件，但当前 ARMSX 的 `cached`/`interpreter` CPU 执行引擎都不会生成本机代码；权限本身不会把当前 CPU 核心变成动态重编译器。设置页中的“JIT 状态”是运行时可执行内存能力探测，不代表当前 CPU 核心已经启用了 JIT。
 
 ## iOS 前端现状
 
@@ -30,7 +29,10 @@ iOS 端使用轻量 UIKit Host 启动 SDL2 和原生 FSUI，不包含 React Nati
 - 使用 FSUI 作为游戏库、设置和暂停界面。
 - iOS 触摸同时保留 SDL 原生多点触摸和主触点到鼠标事件的兼容桥，因此菜单点击与虚拟按键可以同时工作。
 - 虚拟手柄支持多点触控，可同时操作摇杆/方向和右侧功能键。
-- 虚拟手柄支持单布局编辑。各元素可独立拖动，选中后可双指捏合缩放，并支持恢复默认、导出和导入布局。不提供多布局/profile 切换。
+- 设置中可在 `Classic` 与 `DualShock` 两套触控布局间切换。Classic 保留旧的圆形数字方向控件；DualShock 提供上/下/左/右四个独立方向键，以及连续模拟输入的左、右双摇杆。
+- 触控布局编辑器允许各元素独立拖动；选中元素可双指捏合或使用 `28–220 pt` 的尺寸滑杆调整大小。普通元素显示蓝色编辑框，当前选中元素显示黄色框，触控安全区域发生重叠时相关元素显示红框并给出冲突组数。
+- 编辑器提供 `0–100%` 的全局“控件透明度”，同时作用于方向键、双摇杆、面键、肩键、SELECT/START 和暂停键；透明度只影响显示，不改变触控命中。仍支持恢复默认、导出和导入布局；当前不提供任意命名的多 profile 管理。
+- DualShock 触控布局会以模拟手柄方式向核心提供四个模拟轴，并保留数字方向键；SIO0/PAD 实现支持游戏进行 DualShock 配置探测和模式切换。
 - iOS 支持 CoreMotion 重力感应左摇杆。该功能只控制左模拟摇杆 X 轴，适合赛车游戏，支持死区和灵敏度设置；触摸左侧摇杆时触摸输入优先。
 - Advanced 中的重力感应开关属于全局持久设置；游戏内暂停菜单另有“重力感应摇杆 已开启/已关闭”临时开关，只覆盖当前游戏，不写入全局配置。
 - 暂停菜单可继续游戏、进入设置、即时保存、即时读取、更换光盘、截图、重置、临时切换重力感应和返回游戏库。
@@ -40,6 +42,7 @@ iOS 端使用轻量 UIKit Host 启动 SDL2 和原生 FSUI，不包含 React Nati
 - “重置”会销毁当前模拟器 session，并按当前 BIOS、游戏路径和设置完整重新创建 session；不使用仅重置 CPU 的旧 soft reset。
 - “更换光盘”只更换 CD-ROM，不会额外把 CPU 重置回 BIOS，适用于游戏自身要求换盘的场景。
 - Fast Boot 通过修改内存中的 BIOS shell/bootstrap 实现；不会修改用户的 BIOS 文件。如果 BIOS 布局不受支持，会自动回退到正常 BIOS 启动。
+- 游戏退出到游戏库时会把当前画面写入 `Documents/Screenshots/<game>.bmp` 作为稳定缩略图，并立即刷新 FSUI 图片缓存。手动截图同时保留带时间戳的 BMP，并更新同名稳定缩略图；FSUI 已启用 BMP 解码。
 - iOS Documents container 变化后，旧的 Documents 绝对路径会在目标文件实际存在时迁移到当前 container。
 - “退出 App”会先让 frontend 完成 session、FSUI 和 SDL 清理，再由 UIKit Host 正常结束进程，避免只销毁 SDL 窗口后留下黑屏进程。
 
@@ -58,6 +61,8 @@ Documents/
 另外：
 
 - `Documents/Saves/<game>-<hash>.state`：每个游戏的单一即时存档槽。
+- `Documents/Screenshots/<game>.bmp`：游戏库使用的稳定缩略图；退出游戏或成功手动截图后会更新。
+- `Documents/Screenshots/<game>-<timestamp>.bmp`：手动截图生成的带时间戳历史文件。
 - `Documents/ARMSX-TouchLayout.layout`：触控布局导入/导出的交换文件。
 - `Documents/armsx_log.txt`：调试日志开关启用并重新启动 App 后生成的统一运行日志。关闭开关不会自动删除已有旧日志。
 - `Documents/.armsx-debug-log-enabled`：iOS Host 使用的隐藏调试日志启用标记。
@@ -150,7 +155,7 @@ IOS_DEPLOYMENT_TARGET=14.0 \
 4. 复制 SDL2 和 `libarmsx.dylib` 到 App bundle。
 5. 编译 LaunchScreen 和图标资源。
 6. 用 `ldid` 对 SDL2、`libarmsx.dylib` 和主程序进行 fakesign。
-7. 校验 Bundle Identifier、Mach-O deployment target 和 JIT entitlement。
+7. 校验 Bundle Identifier、Mach-O deployment target 和 JIT entitlement，并确认最终签名不包含 `dynamic-codesigning`。
 8. 生成 IPA，并打印 SHA-256。
 
 成功后输出：
@@ -228,7 +233,7 @@ unzip -t dist/ARMSX-iOS14-JIT.ipa
 ldid -e build/ios-ipa/stage/Payload/ARMSX.app/ARMSX
 ```
 
-应能看到前文列出的四项 entitlement。
+应能看到前文列出的三项 entitlement，并且不应出现 `dynamic-codesigning`。
 
 ## BIOS 与测试资源
 
@@ -323,7 +328,7 @@ rebase 完成后用 range-diff 或等效方式核对本地补丁语义是否保�
 
 - 当前 CPU 后端仍以解释器为主，JIT entitlement 只是运行权限准备。
 - JIT 状态只探测安全的可执行内存权限路径，不会通过实际跳转执行动态生成的机器码来冒险测试；“未确认”不等于越狱环境一定没有其它 JIT 绕过路径。
-- 即时存档是当前 ARMSX 新增实现，格式带版本和结构尺寸校验，但仍属于核心状态序列化功能；上游设备结构变化后必须同步审查状态格式。
+- 即时存档是当前新增实现，格式带版本和结构尺寸校验，但仍属于核心状态序列化功能；上游设备结构变化后必须同步审查状态格式。
 - 重力感应摇杆目前是 iOS CoreMotion 功能，只映射左模拟摇杆 X 轴，不是通用陀螺仪到所有轴/按键的映射系统。
 - Fast Boot 依赖 BIOS 布局。受支持布局会应用内存补丁；不支持时会正常回退，不应修改 BIOS 原文件。
 - Xcode GUI 工程主要用于开发调试；要得到 iOS 14 TrollStore/Dopamine 包，应以 `ios/build-ipa.sh` 的输出为准。
