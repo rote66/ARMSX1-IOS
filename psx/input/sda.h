@@ -13,6 +13,7 @@
 #define SDA_MODEL_DIGITAL       0x41
 #define SDA_MODEL_ANALOG_PAD    0x73
 #define SDA_MODEL_ANALOG_STICK  0x53
+#define SDA_MODEL_CONFIG        0xf3
 
 #define PSXI_SW_SDA_SELECT      0x00000001
 #define PSXI_SW_SDA_L3          0x00000002

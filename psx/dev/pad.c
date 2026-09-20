@@ -3,9 +3,53 @@
 #include <string.h>
 
 #include "pad.h"
-#include "../log.h"
 
 #define JOY_IRQ_DELAY 512
+#define JOY_ACK_LOW_CYCLES 100
+
+static void pad_reset_input_transfer(psx_input_t* input) {
+    if (input && input->reset_transfer_func)
+        input->reset_transfer_func(input->udata);
+}
+
+static void pad_reset_device_transfers(psx_pad_t* pad) {
+    for (int slot = 0; slot < 2; slot++) {
+        pad_reset_input_transfer(pad->joy_slot[slot]);
+        if (pad->mcd_slot[slot])
+            psx_mcd_reset(pad->mcd_slot[slot]);
+        pad->dest[slot] = 0;
+    }
+}
+
+static void pad_soft_reset(psx_pad_t* pad) {
+    pad->mode = 0;
+    pad->ctrl = 0;
+    pad->stat = 0;
+    pad->enable_once = 0;
+    pad->cycles_until_irq = 0;
+    pad->cycles_until_ack_high = 0;
+    pad->cycle_counter = 0;
+    pad->irq_bit = 0;
+    pad->rx_ready = 0;
+    pad_reset_device_transfers(pad);
+}
+
+static int pad_input_wants_ack(psx_input_t* input) {
+    if (!input)
+        return 0;
+
+    if (input->query_ack_func)
+        return input->query_ack_func(input->udata);
+
+    return input->query_fifo_func ? input->query_fifo_func(input->udata) : 0;
+}
+
+static void pad_schedule_joy_ack(psx_pad_t* pad) {
+    /* /ACK is a physical peripheral signal and exists regardless of whether
+     * ACK interrupts are enabled.  CTRL_ACIE only gates the IRQ side. */
+    pad->irq_bit = (pad->ctrl & CTRL_ACIE) != 0;
+    pad->cycles_until_irq = JOY_IRQ_DELAY;
+}
 
 uint32_t pad_read_rx(psx_pad_t* pad) {
     int slot = (pad->ctrl >> 13) & 1;
@@ -13,11 +57,18 @@ uint32_t pad_read_rx(psx_pad_t* pad) {
     psx_input_t* joy = pad->joy_slot[slot];
     psx_mcd_t* mcd = pad->mcd_slot[slot];
 
-    if (!pad->dest[slot])
+    if (!pad->rx_ready)
         return 0xffffffff;
 
     if (!(pad->ctrl & CTRL_JOUT) && !(pad->ctrl & CTRL_RXEN))
         return 0xffffffff;
+
+    pad->rx_ready = 0;
+    if (pad->ctrl & CTRL_RXEN)
+        pad->ctrl &= ~CTRL_RXEN;
+
+    if (!pad->dest[slot])
+        return 0xff;
 
     switch (pad->dest[slot]) {
         case DEST_JOY: {
@@ -63,17 +114,35 @@ void pad_write_tx(psx_pad_t* pad, uint16_t data) {
     if (!(pad->ctrl & CTRL_TXEN))
         return;
 
+    if (!(pad->ctrl & CTRL_JOUT)) {
+        pad->rx_ready = 0;
+        return;
+    }
+
+    /* SIO0 shifts a byte in while shifting the host byte out.  The current
+     * device abstraction generates that received byte lazily in pad_read_rx,
+     * so mark the receive register full as soon as the transfer is issued. */
+    pad->rx_ready = 1;
+
     if (!pad->dest[slot]) {
         if ((data == DEST_JOY) || (data == DEST_MCD)) {
             pad->dest[slot] = data;
 
-            if ((data == DEST_JOY) && !joy)
+            if ((data == DEST_JOY) && !joy) {
+                pad->dest[slot] = 0;
                 return;
 
-            if ((data == DEST_MCD) && !mcd)
+            }
+
+            if ((data == DEST_MCD) && !mcd) {
+                pad->dest[slot] = 0;
                 return;
 
-            if (pad->ctrl & CTRL_ACIE)
+            }
+
+            if (data == DEST_JOY)
+                pad_schedule_joy_ack(pad);
+            else if (pad->ctrl & CTRL_ACIE)
                 pad->cycles_until_irq = JOY_IRQ_DELAY;
         }
     } else {
@@ -87,8 +156,17 @@ void pad_write_tx(psx_pad_t* pad, uint16_t data) {
 
                 joy->write_func(joy->udata, data);
 
+                const int should_ack = pad_input_wants_ack(joy);
+
                 if (!joy->query_fifo_func(joy->udata))
                     pad->dest[slot] = 0;
+
+                /* A controller's /ACK means that another response byte is
+                 * available.  Do not emit ACK/IRQ after the final byte. */
+                if (should_ack)
+                    pad_schedule_joy_ack(pad);
+
+                return;
             } break;
 
             case DEST_MCD: {
@@ -120,26 +198,50 @@ void pad_write_tx(psx_pad_t* pad, uint16_t data) {
 }
 
 uint32_t pad_handle_stat_read(psx_pad_t* pad) {
-    return pad->stat | 7;
+    uint32_t value = pad->stat | STAT_TXR1 | STAT_TXR2;
+
+    if (pad->rx_ready)
+        value |= STAT_RXNE;
+    else
+        value &= ~STAT_RXNE;
+
+    /* ACKINPUT is a short pulse.  Reading JOY_STAT samples it and allows a
+     * polling driver to observe the subsequent high level on the next read. */
+    if (pad->stat & STAT_ACKL) {
+        pad->stat &= ~STAT_ACKL;
+        pad->cycles_until_ack_high = 0;
+    }
+
+    return value;
 }
 
 void pad_handle_ctrl_write(psx_pad_t* pad, uint32_t value) {
-    int slot = pad->ctrl & CTRL_SLOT;
+    const uint16_t old_ctrl = pad->ctrl;
+    const int old_slot = (old_ctrl & CTRL_SLOT) >> 13;
 
-    pad->ctrl = value;
+    pad->ctrl = value & 0xffff;
+
+    if (pad->ctrl & CTRL_REST) {
+        pad_soft_reset(pad);
+        return;
+    }
 
     if (!(pad->ctrl & CTRL_JOUT)) {
         pad->ctrl &= ~CTRL_SLOT;
-
-        if (pad->mcd_slot[slot >> 13])
-            psx_mcd_reset(pad->mcd_slot[slot >> 13]);
+        pad->rx_ready = 0;
+        pad->cycles_until_irq = 0;
+        pad->cycles_until_ack_high = 0;
+        pad->stat &= ~STAT_ACKL;
+        pad->dest[old_slot] = 0;
+        pad_reset_device_transfers(pad);
     }
 
     // Reset STAT bits 3, 4, 5, 9
     if (pad->ctrl & CTRL_ACKN) {
-        pad->stat &= 0xfdc7;
+        pad->stat &= ~(STAT_RXPE | STAT_UNK4 | STAT_UNK5 | STAT_IRQ7);
         pad->ctrl &= ~CTRL_ACKN;
     }
+
 }
 
 psx_pad_t* psx_pad_create(void) {
@@ -305,7 +407,7 @@ int psx_pad_attach_mcd(psx_pad_t* pad, int slot, const char* path) {
         return 1;
 
     int r = psx_mcd_init(mcd, path);
-    
+
     if (r) {
         psx_mcd_destroy(mcd);
 
@@ -327,14 +429,25 @@ void psx_pad_detach_mcd(psx_pad_t* pad, int slot) {
 }
 
 void psx_pad_update(psx_pad_t* pad, int cyc) {
+    if (pad->cycles_until_ack_high) {
+        pad->cycles_until_ack_high -= cyc;
+
+        if (pad->cycles_until_ack_high <= 0) {
+            pad->stat &= ~STAT_ACKL;
+            pad->cycles_until_ack_high = 0;
+        }
+    }
+
     if (pad->cycles_until_irq) {
         pad->cycles_until_irq -= cyc;
 
         if (pad->cycles_until_irq <= 0) {
-            psx_ic_irq(pad->ic, IC_JOY);
+            pad->stat |= STAT_ACKL;
+            pad->cycles_until_ack_high = JOY_ACK_LOW_CYCLES;
 
-            if (pad->irq_bit) {
+            if (pad->irq_bit && (pad->ctrl & CTRL_ACIE)) {
                 pad->stat |= STAT_IRQ7;
+                psx_ic_irq(pad->ic, IC_JOY);
                 pad->irq_bit = 0;
             }
 

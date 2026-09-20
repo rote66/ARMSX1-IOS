@@ -13,6 +13,8 @@ typedef void (*psx_input_on_button_press_t)(void*, uint32_t);
 typedef void (*psx_input_on_button_release_t)(void*, uint32_t);
 typedef void (*psx_input_on_analog_change_t)(void*, uint32_t, uint16_t);
 typedef int (*psx_input_query_fifo_t)(void*);
+typedef int (*psx_input_query_ack_t)(void*);
+typedef void (*psx_input_reset_transfer_t)(void*);
 
 struct psx_input_t {
     void* udata;
@@ -23,6 +25,8 @@ struct psx_input_t {
     psx_input_on_button_release_t on_button_release_func;
     psx_input_on_analog_change_t on_analog_change_func;
     psx_input_query_fifo_t query_fifo_func;
+    psx_input_query_ack_t query_ack_func;
+    psx_input_reset_transfer_t reset_transfer_func;
 };
 
 psx_input_t* psx_input_create(void);
@@ -33,6 +37,8 @@ void psx_input_set_on_button_press_func(psx_input_t*, psx_input_on_button_press_
 void psx_input_set_on_button_release_func(psx_input_t*, psx_input_on_button_release_t);
 void psx_input_set_on_analog_change_func(psx_input_t*, psx_input_on_analog_change_t);
 void psx_input_set_query_fifo_func(psx_input_t*, psx_input_query_fifo_t);
+void psx_input_set_query_ack_func(psx_input_t*, psx_input_query_ack_t);
+void psx_input_set_reset_transfer_func(psx_input_t*, psx_input_reset_transfer_t);
 void psx_input_destroy(psx_input_t*);
 
 #endif

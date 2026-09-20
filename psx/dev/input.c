@@ -34,6 +34,18 @@ void psx_input_set_on_analog_change_func(psx_input_t* input, psx_input_on_analog
     input->on_analog_change_func = on_analog_change_func;
 }
 
+void psx_input_set_query_fifo_func(psx_input_t* input, psx_input_query_fifo_t query_fifo_func) {
+    input->query_fifo_func = query_fifo_func;
+}
+
+void psx_input_set_query_ack_func(psx_input_t* input, psx_input_query_ack_t query_ack_func) {
+    input->query_ack_func = query_ack_func;
+}
+
+void psx_input_set_reset_transfer_func(psx_input_t* input, psx_input_reset_transfer_t reset_transfer_func) {
+    input->reset_transfer_func = reset_transfer_func;
+}
+
 void psx_input_destroy(psx_input_t* input) {
     free(input->udata);
     free(input);

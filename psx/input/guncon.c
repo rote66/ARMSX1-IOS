@@ -123,6 +123,20 @@ int psxi_guncon_query_fifo(void* udata) {
     return guncon->tx_data_ready;
 }
 
+int psxi_guncon_query_ack(void* udata) {
+    psxi_guncon_t* guncon = (psxi_guncon_t*)udata;
+
+    return guncon->tx_data_ready && guncon->state < GUNCON_STATE_TX_YPH;
+}
+
+void psxi_guncon_reset_transfer(void* udata) {
+    psxi_guncon_t* guncon = (psxi_guncon_t*)udata;
+
+    guncon->state = GUNCON_STATE_TX_HIZ;
+    guncon->tx_data = 0xff;
+    guncon->tx_data_ready = 1;
+}
+
 void psxi_guncon_init_input(psxi_guncon_t* guncon, psx_input_t* input) {
     input->udata = guncon;
     input->write_func = psxi_guncon_write;
@@ -131,6 +145,8 @@ void psxi_guncon_init_input(psxi_guncon_t* guncon, psx_input_t* input) {
     input->on_button_release_func = psxi_guncon_on_button_release;
     input->on_analog_change_func = psxi_guncon_on_analog_change;
     input->query_fifo_func = psxi_guncon_query_fifo;
+    input->query_ack_func = psxi_guncon_query_ack;
+    input->reset_transfer_func = psxi_guncon_reset_transfer;
 }
 
 void psxi_guncon_destroy(psxi_guncon_t* guncon) {
