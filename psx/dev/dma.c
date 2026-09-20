@@ -58,13 +58,13 @@ uint32_t psx_dma_read32(psx_dma_t* dma, uint32_t offset) {
             cr &= g_psx_dma_ctrl_hw_0_table[channel];
         }
 
-        log_error("DMA channel %u register %u (%08x) read %08x", channel, reg, PSX_DMAR_BEGIN + offset, cr);
+        log_debug("DMA channel %u register %u (%08x) read %08x", channel, reg, PSX_DMAR_BEGIN + offset, cr);
         
         return cr;
     } else {
         switch (offset) {
-            case 0x70: log_error("DMA control read %08x", dma->dpcr); return dma->dpcr;
-            case 0x74: log_error("DMA irqc    read %08x", dma->dicr); return dma->dicr;
+            case 0x70: log_debug("DMA control read %08x", dma->dpcr); return dma->dpcr;
+            case 0x74: log_debug("DMA irqc    read %08x", dma->dicr); return dma->dicr;
 
             default: {
                 log_error("Unhandled 32-bit DMA read at offset %08x", offset);
@@ -124,13 +124,13 @@ void psx_dma_write32(psx_dma_t* dma, uint32_t offset, uint32_t value) {
 
         CR(channel, reg) = value;
 
-        log_error("DMA channel %u register %u write (%08x) %08x", channel, reg, PSX_DMAR_BEGIN + offset, value);
+        log_debug("DMA channel %u register %u write (%08x) %08x", channel, reg, PSX_DMAR_BEGIN + offset, value);
 
         if (reg == 2)
             g_psx_dma_do_table[channel](dma);
     } else {
         switch (offset) {
-            case 0x70: log_error("DMA control write %08x", value); dma->dpcr = value; break;
+            case 0x70: log_debug("DMA control write %08x", value); dma->dpcr = value; break;
             case 0x74: {
                 dma_write_dicr(dma, value);
             } break;

@@ -2055,7 +2055,7 @@ void psx_gpu_write32(psx_gpu_t* gpu, uint32_t offset, uint32_t value) {
                 } break;
             }
 
-            log_error("GP1(%02Xh) args=%06x", value >> 24, value & 0xffffff);
+            log_debug("GP1(%02Xh) args=%06x", value >> 24, value & 0xffffff);
 
             return;
         } break;
