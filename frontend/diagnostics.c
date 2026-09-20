@@ -30,6 +30,7 @@ typedef struct {
 } psxe_diag_stream_buffer_t;
 
 static FILE* g_diag_file = NULL;
+static size_t g_diag_pending_lines = 0;
 static char g_diag_log_path[1024] = {0};
 static char g_diag_run_tag[64] = {0};
 static int g_diag_enabled = 0;
@@ -111,6 +112,7 @@ static void psxe_diag_close_file(void) {
     fflush(g_diag_file);
     fclose(g_diag_file);
     g_diag_file = NULL;
+    g_diag_pending_lines = 0;
 }
 
 static void psxe_diag_update_file_handle(void) {
@@ -121,6 +123,10 @@ static void psxe_diag_update_file_handle(void) {
     }
 
     g_diag_file = fopen(g_diag_log_path, "a");
+    if (g_diag_file) {
+        setvbuf(g_diag_file, NULL, _IOFBF, 64u * 1024u);
+        g_diag_pending_lines = 0;
+    }
 }
 
 static void psxe_diag_timestamp(char* buffer, size_t capacity) {
@@ -158,7 +164,11 @@ static void psxe_diag_emit_line(const char* source, const char* line) {
     if (g_diag_file) {
         fputs(formatted, g_diag_file);
         fputc('\n', g_diag_file);
-        fflush(g_diag_file);
+        ++g_diag_pending_lines;
+        if (g_diag_pending_lines >= 128u) {
+            fflush(g_diag_file);
+            g_diag_pending_lines = 0;
+        }
     }
 
     psxe_diag_output_debug_string(formatted);
