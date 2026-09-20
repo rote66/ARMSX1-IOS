@@ -69,14 +69,23 @@ void real_idct(int16_t* blk, int16_t* scale) {
 
 #define IDCT_FUNC(blk, scale) real_idct(blk, scale)
 
-uint16_t* rl_decode_block(int16_t* blk, uint16_t* src, uint16_t* end, uint8_t* quant, int16_t* scale) {
+uint16_t* rl_decode_block(
+    int16_t* blk,
+    uint16_t* src,
+    uint16_t* end,
+    uint8_t* quant,
+    int16_t* scale,
+    int* complete
+) {
     int k = 0;
+
+    if (complete)
+        *complete = 0;
 
     for (int i = 0; i < 64; i++)
         blk[i] = 0;
 
     if (!src || !end || src >= end) {
-        IDCT_FUNC(blk, scale);
         return end;
     }
 
@@ -107,23 +116,36 @@ uint16_t* rl_decode_block(int16_t* blk, uint16_t* src, uint16_t* end, uint8_t* q
         if (!q_scale)
             blk[k] = val;
 
-        if (src >= end || k == 63)
+        if (k == 63) {
+            if (complete)
+                *complete = 1;
+            break;
+        }
+
+        if (src >= end)
             break;
 
         n = *src++;
 
-        if (n == 0xfe00)
+        if (n == 0xfe00) {
+            if (complete)
+                *complete = 1;
             break;
+        }
 
         k += ((n >> 10) & 0x3f) + 1;
 
-        if (k >= 64)
+        if (k >= 64) {
+            if (complete)
+                *complete = 1;
             break;
+        }
 
         val = (EXTS10(n & 0x3ff) * quant[k] * q_scale + 4) / 8;
     }
 
-    IDCT_FUNC(blk, scale);
+    if (complete && *complete)
+        IDCT_FUNC(blk, scale);
 
     return src;
 }
@@ -186,24 +208,75 @@ void yuv_to_rgb(psx_mdec_t* mdec, uint8_t* buf, int xx, int yy) {
 
 void mdec_nop(psx_mdec_t* mdec) { /* Do nothing */ }
 
-void mdec_decode_macroblock(psx_mdec_t* mdec) {
-    uint16_t* const input_begin = (uint16_t*)mdec->input;
-    uint16_t* const input_end = (uint16_t*)(mdec->input + mdec->input_size);
+static void mdec_release_decode_input(psx_mdec_t* mdec) {
+    free(mdec->input);
+    mdec->input = NULL;
+    mdec->input_size = 0;
+    mdec->input_index = 0;
+    mdec->index = 0;
+    mdec->input_full = 0;
+}
 
-    if (!mdec->input || mdec->input_size < sizeof(uint16_t)) {
+void mdec_decode_macroblock(psx_mdec_t* mdec) {
+    if (!mdec->input || mdec->input_size < sizeof(uint16_t) ||
+        mdec->index < 0 || (size_t)mdec->index >= mdec->input_size) {
         mdec->output_words_remaining = 0;
         mdec->output_empty = 1;
         mdec->output_request = 0;
+        mdec_release_decode_input(mdec);
+        return;
+    }
+
+    uint8_t* const input_bytes = (uint8_t*)mdec->input;
+    uint16_t* const input_begin = (uint16_t*)(input_bytes + (size_t)mdec->index);
+    uint16_t* const input_end = (uint16_t*)(input_bytes + mdec->input_size);
+    uint16_t* probe = input_begin;
+
+    while (probe < input_end && *probe == 0xfe00)
+        ++probe;
+
+    if (probe >= input_end) {
+        mdec->index = (int)mdec->input_size;
+        mdec->output_words_remaining = 0;
+        mdec->output_empty = 1;
+        mdec->output_request = 0;
+        mdec_release_decode_input(mdec);
         return;
     }
 
     if (mdec->output_depth < 2) {
-        size_t block_size = (mdec->output_depth == 3) ? 512 : 768;
-        size_t size = block_size;
+        const size_t output_size = 64;
 
-        mdec->output = malloc(size);
+        uint8_t* output = realloc(mdec->output, output_size);
 
-        rl_decode_block(mdec->yblk, input_begin, input_end, mdec->y_quant_table, mdec->scale_table);
+        if (!output) {
+            log_error("MDEC output allocation failed size=%zu", output_size);
+            mdec->output_words_remaining = 0;
+            mdec->output_empty = 1;
+            mdec->output_request = 0;
+            return;
+        }
+
+        mdec->output = output;
+
+        int complete = 0;
+        uint16_t* in = rl_decode_block(
+            mdec->yblk,
+            input_begin,
+            input_end,
+            mdec->y_quant_table,
+            mdec->scale_table,
+            &complete
+        );
+        mdec->index = (int)((uint8_t*)in - input_bytes);
+
+        if (!complete) {
+            mdec->output_words_remaining = 0;
+            mdec->output_empty = 1;
+            mdec->output_request = 0;
+            mdec_release_decode_input(mdec);
+            return;
+        }
 
         for (int i = 0; i < 64; i++) {
             int16_t y = mdec->yblk[i] & 0xff;
@@ -219,52 +292,58 @@ void mdec_decode_macroblock(psx_mdec_t* mdec) {
         mdec->output_words_remaining = ((mdec->output_depth == 1) ? 64 : 32) >> 2;
         mdec->output_empty = 0;
         mdec->output_index = 0;
+        mdec->output_request = mdec->enable_dma1;
     } else {
-        uint16_t* in = input_begin;
+        const size_t block_size = (mdec->output_depth == 3) ? 512u : 768u;
+        uint8_t* output = realloc(mdec->output, block_size);
 
-        size_t block_size = (mdec->output_depth == 3) ? 512 : 768;
-        size_t size = block_size;
-
-        unsigned long bytes_processed = 0;
-
-        int block_count = 1;
-
-        while (in < input_end && bytes_processed < mdec->input_size) {
-            if (!mdec->output) {
-                mdec->output = malloc(block_count * size);
-            } else {
-                mdec->output = realloc(mdec->output, block_count * size);
-            }
-
-            in = rl_decode_block(mdec->crblk, in, input_end, mdec->uv_quant_table, mdec->scale_table);
-            in = rl_decode_block(mdec->cbblk, in, input_end, mdec->uv_quant_table, mdec->scale_table);
-            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
-            yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 0, 0);
-            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
-            yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 8, 0);
-            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
-            yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 0, 8);
-            in = rl_decode_block(mdec->yblk, in, input_end, mdec->y_quant_table, mdec->scale_table);
-            yuv_to_rgb(mdec, &mdec->output[(block_count * size) - block_size], 8, 8);
-
-            bytes_processed = (uintptr_t)in - (uintptr_t)mdec->input;
-
-            ++block_count;
+        if (!output) {
+            log_error("MDEC output allocation failed size=%zu", block_size);
+            mdec->output_words_remaining = 0;
+            mdec->output_empty = 1;
+            mdec->output_request = 0;
+            return;
         }
 
-        mdec->output_words_remaining = ((block_count - 1) * block_size) >> 2;
+        mdec->output = output;
+
+        uint16_t* in = input_begin;
+        int complete = 0;
+
+#define MDEC_DECODE_BLOCK(dst, quant) \
+        do { \
+            in = rl_decode_block((dst), in, input_end, (quant), mdec->scale_table, &complete); \
+            if (!complete) \
+                goto incomplete_macroblock; \
+        } while (0)
+
+        MDEC_DECODE_BLOCK(mdec->crblk, mdec->uv_quant_table);
+        MDEC_DECODE_BLOCK(mdec->cbblk, mdec->uv_quant_table);
+        MDEC_DECODE_BLOCK(mdec->yblk, mdec->y_quant_table);
+        yuv_to_rgb(mdec, mdec->output, 0, 0);
+        MDEC_DECODE_BLOCK(mdec->yblk, mdec->y_quant_table);
+        yuv_to_rgb(mdec, mdec->output, 8, 0);
+        MDEC_DECODE_BLOCK(mdec->yblk, mdec->y_quant_table);
+        yuv_to_rgb(mdec, mdec->output, 0, 8);
+        MDEC_DECODE_BLOCK(mdec->yblk, mdec->y_quant_table);
+        yuv_to_rgb(mdec, mdec->output, 8, 8);
+
+#undef MDEC_DECODE_BLOCK
+
+        mdec->index = (int)((uint8_t*)in - input_bytes);
+        mdec->output_words_remaining = (uint32_t)(block_size >> 2);
         mdec->output_empty = 0;
         mdec->output_index = 0;
+        mdec->output_request = mdec->enable_dma1;
+        return;
 
-        // printf("output words remaining: %d (%x) count=%d block_size=%lld size=%lld\n", mdec->output_words_remaining, mdec->output_words_remaining, block_count, block_size, size);
-
-        // log_set_quiet(0);
-        // log_fatal("Finished decoding %u-bit MDEC data input=(%04x -> %08x)",
-        //     (mdec->output_depth == 3) ? 15 : 24,
-        //     mdec->input_size,
-        //     mdec->output_words_remaining
-        // );
-        // log_set_quiet(1);
+incomplete_macroblock:
+#undef MDEC_DECODE_BLOCK
+        mdec->index = (int)((uint8_t*)in - input_bytes);
+        mdec->output_words_remaining = 0;
+        mdec->output_empty = 1;
+        mdec->output_request = 0;
+        mdec_release_decode_input(mdec);
     }
 }
 
@@ -314,16 +393,26 @@ uint32_t psx_mdec_read32(psx_mdec_t* mdec, uint32_t offset) {
             // return 0xaaaaaaaa;
 
             if (mdec->output_words_remaining) {
+                const uint32_t value = ((uint32_t*)mdec->output)[mdec->output_index++];
                 --mdec->output_words_remaining;
+
+                if (!mdec->output_words_remaining) {
+                    mdec->output_empty = 1;
+                    mdec->output_index = 0;
+                    mdec->output_request = 0;
+
+                    if (mdec->input && ((mdec->cmd >> 29) == MDEC_CMD_DECODE))
+                        mdec_decode_macroblock(mdec);
+                }
 
                 // log_set_quiet(0);
                 // log_fatal("output read %08x", 0);
                 // log_set_quiet(1);
 
-                return ((uint32_t*)mdec->output)[mdec->output_index++];
+                return value;
             } else {
                 // printf("no read words remaining\n");
-                mdec->output_empty = 0;
+                mdec->output_empty = 1;
                 mdec->output_index = 0;
                 mdec->output_request = 0;
 
@@ -383,10 +472,17 @@ void psx_mdec_write32(psx_mdec_t* mdec, uint32_t offset, uint32_t value) {
 
                     g_mdec_cmd_table[mdec->cmd >> 29](mdec);
 
-                    free(mdec->input);
-                    mdec->input = NULL;
-                    mdec->input_size = 0;
-                    mdec->input_index = 0;
+                    if ((mdec->cmd >> 29) != MDEC_CMD_DECODE) {
+                        mdec->output_words_remaining = 0;
+                        mdec->output_index = 0;
+                        mdec->output_empty = 1;
+                        mdec->output_request = 0;
+                        free(mdec->input);
+                        mdec->input = NULL;
+                        mdec->input_size = 0;
+                        mdec->input_index = 0;
+                        mdec->index = 0;
+                    }
                 }
 
                 break;
@@ -399,6 +495,7 @@ void psx_mdec_write32(psx_mdec_t* mdec, uint32_t offset, uint32_t value) {
             mdec->output_signed = (value >> 26) & 1;
             mdec->output_depth = (value >> 27) & 3;
             mdec->input_index = 0;
+            mdec->index = 0;
             mdec->input_full = 0;
             mdec->busy = 1;
 
@@ -450,7 +547,16 @@ void psx_mdec_write32(psx_mdec_t* mdec, uint32_t offset, uint32_t value) {
                 mdec->input_size = mdec->words_remaining * sizeof(uint32_t);
                 mdec->input_full = 0;
                 mdec->input_index = 0;
+                free(mdec->input);
                 mdec->input = malloc(mdec->input_size);
+
+                if (!mdec->input) {
+                    log_error("MDEC input allocation failed size=%zu", mdec->input_size);
+                    mdec->input_size = 0;
+                    mdec->words_remaining = 0;
+                    mdec->input_request = 0;
+                    mdec->busy = 0;
+                }
             }
         } break;
 
@@ -461,9 +567,17 @@ void psx_mdec_write32(psx_mdec_t* mdec, uint32_t offset, uint32_t value) {
 
             // Reset
             if (value & 0x80000000) {
+                free(mdec->input);
+                mdec->input = NULL;
+                mdec->input_size = 0;
+                mdec->input_index = 0;
+                mdec->index = 0;
+
                 // status = 80040000h
                 mdec->busy            = 0;
                 mdec->words_remaining = 0;
+                mdec->output_words_remaining = 0;
+                mdec->output_index    = 0;
                 mdec->output_bit15    = 0;
                 mdec->output_signed   = 0;
                 mdec->output_depth    = 0;
